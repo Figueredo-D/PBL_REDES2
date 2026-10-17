@@ -4,60 +4,68 @@ import (
 	"time"
 )
 
+// SearchFilter representa os parâmetros informados pelo passageiro na busca de itinerários.
 type SearchFilter struct {
-	Origin      string
-	Destination string
-	Date        string
+	Origin      string `json:"origin"`
+	Destination string `json:"destination"` 
+	Date        string `json:"date"`
 }
 
-// detalha o trecho individual no itinerário para o passageiro!!!!!!!!!
+// ItinerarySegmentDetail descreve detalhadamente um trecho do itinerário gerado na busca.
+// É essencial incluir CompanyID para saber a qual servidor do consórcio este trecho pertence.
 type ItinerarySegmentDetail struct {
-	RideID         string  `json:"ride_id"`
-	DriverToken    string  `json:"driver_token"`
-	From           string  `json:"from"`
-	To             string  `json:"to"`
-	DepartureTime  string  `json:"departure_time"`
-	Price          float64 `json:"price"`
-	AvailableSeats int     `json:"available_seats"`
+	RideID         string  `json:"ride_id"`        // ID da carona correspondente
+	CompanyID      string  `json:"company_id"`     // Empresa responsável por este trecho (utilizado no 2PC)
+	DriverToken    string  `json:"driver_token"`   // Token do motorista deste trecho
+	From           string  `json:"from"`           // Origem do trecho
+	To             string  `json:"to"`             // Destino do trecho
+	DepartureTime  string  `json:"departure_time"` // Horário de partida do trecho
+	Price          float64 `json:"price"`          // Valor deste trecho
+	AvailableSeats int     `json:"available_seats"`// Vagas restantes neste trecho
 }
 
-//representa a rota completa encontrada pelo algoritmo (direta ou combinada)
+// ItineraryResult representa uma rota completa (direta ou combinada) encontrada pelo algoritmo de busca.
 type ItineraryResult struct {
-	ItineraryID    string                   `json:"itinerary_id"`
-	Segments       []ItinerarySegmentDetail `json:"segments"`
-	TotalPrice     float64                  `json:"total_price"`
-	DepartureTime  string                   `json:"departure_time"`
-	AvailableSeats int                      `json:"available_seats"` // Vagas gargalo (menor valor entre os trechos)
-	Drivers        []string                 `json:"drivers"`         // Lista de motoristas na rota
+	ItineraryID    string                   `json:"itinerary_id"`    // Identificador do itinerário
+	Segments       []ItinerarySegmentDetail `json:"segments"`        // Trechos que compõem o caminho
+	TotalPrice     float64                  `json:"total_price"`     // Soma do preço de todos os trechos
+	DepartureTime  string                   `json:"departure_time"`  // Horário de partida no primeiro trecho
+	AvailableSeats int                      `json:"available_seats"` // Vagas gargalo (a menor quantidade de vagas entre os trechos)
+	Drivers        []string                 `json:"drivers"`         // Lista de tokens dos motoristas envolvidos
 }
 
-//representa uma aresta no Grafo de viagens
+// GraphEdge representa uma aresta no Grafo montado temporariamente para a busca em largura (BFS).
 type GraphEdge struct {
 	Ride        *Ride
 	Segment     *Segment
 	From        string
 	To          string
 	DriverToken string
+	CompanyID   string
 }
 
-//é um nó utilizado na travessia BFS para rastrear o caminho percorrido
+// PathNode é a estrutura utilizada na fila da BFS para acompanhar os caminhos percorridos.
 type PathNode struct {
-	City  string
-	Edges []GraphEdge
+	City  string      // Cidade atual onde o nó se encontra
+	Edges []GraphEdge // Lista de arestas/trechos percorridos até chegar a esta cidade
 }
 
-//utiliza Busca em Grafo (BFS) para mapear trajetos diretos e combinados
+// FindItineraries utiliza a Busca em Largura (BFS) no Grafo em memória para encontrar
+// todas as combinações de trajetos possíveis (diretos ou com conexão) que atendam ao filtro.
 func FindItineraries(rides []*Ride, filter SearchFilter) []ItineraryResult {
 	var results []ItineraryResult
 	now := time.Now()
 
+	// Cria o adjacency list do Grafo mapeando: CidadeOrigem -> []ArestasDisponíveis
 	graph := make(map[string][]GraphEdge)
 
 	for _, ride := range rides {
+		// Ignora caronas de datas diferentes da buscada
 		if ride.Date != filter.Date {
 			continue
 		}
 
+		// Se a carona for para hoje, ignora caronas cujo horário de partida já passou
 		if ride.Date == now.Format("2006-01-02") {
 			departureDateTime, err := time.Parse("2006-01-02 15:04", ride.Date+" "+ride.Time)
 			if err == nil && departureDateTime.Before(now) {
@@ -65,7 +73,8 @@ func FindItineraries(rides []*Ride, filter SearchFilter) []ItineraryResult {
 			}
 		}
 
-		ride.mu.RLock()
+		// Leitura concorrencial segura usando a trava fina de leitura da carona
+		ride.RLock()
 		for _, seg := range ride.Segments {
 			if seg.AvailableSeats > 0 {
 				graph[seg.From] = append(graph[seg.From], GraphEdge{
@@ -74,43 +83,54 @@ func FindItineraries(rides []*Ride, filter SearchFilter) []ItineraryResult {
 					From:        seg.From,
 					To:          seg.To,
 					DriverToken: ride.DriverToken,
+					CompanyID:   ride.CompanyID,
 				})
 			}
 		}
-		ride.mu.RUnlock()
+		ride.RUnlock()
 	}
+
+	// Fila da BFS inicializada com a cidade de origem solicitada
 	queue := []PathNode{{City: filter.Origin, Edges: []GraphEdge{}}}
 
 	for len(queue) > 0 {
+		// Desenfileira o primeiro caminho da fila
 		current := queue[0]
 		queue = queue[1:]
 
+		// Se chegamos ao destino desejado e percorremos ao menos 1 trecho, montamos o resultado
 		if current.City == filter.Destination && len(current.Edges) > 0 {
 			res := buildItineraryResult(current.Edges)
 			results = append(results, res)
 			continue
 		}
 
-		// Limite de conexões/trocas de carona para evitar trajetos gigantes ou loops
+		// Trava de segurança: limita conexões a no máximo 4 trechos para evitar caminhos gigantes ou infinitos
 		if len(current.Edges) >= 4 {
 			continue
 		}
 
+		// Explora as conexões a partir da cidade atual
 		for _, edge := range graph[current.City] {
+			// Evita ciclos (passar pela mesma cidade duas vezes na mesma viagem)
 			if hasVisitedCity(current.Edges, edge.To) {
 				continue
 			}
 
+			// Validação temporal das conexões: em viagens combinadas com caronas diferentes,
+			// a segunda carona não pode partir antes do horário da primeira carona
 			if len(current.Edges) > 0 {
 				lastEdge := current.Edges[len(current.Edges)-1]
 				if edge.Ride.ID != lastEdge.Ride.ID && edge.Ride.Time < lastEdge.Ride.Time {
-					continue // nao permite conexão com horário anterior ao trecho de partida
+					continue
 				}
 			}
 
+			// Copia os trechos anteriores e adiciona o novo trecho
 			newEdges := append([]GraphEdge{}, current.Edges...)
 			newEdges = append(newEdges, edge)
 
+			// Enfileira o novo nó expandido para continuar a BFS
 			queue = append(queue, PathNode{
 				City:  edge.To,
 				Edges: newEdges,
@@ -121,6 +141,7 @@ func FindItineraries(rides []*Ride, filter SearchFilter) []ItineraryResult {
 	return results
 }
 
+// hasVisitedCity verifica se uma cidade já faz parte dos trechos percorridos (prevenção de ciclos).
 func hasVisitedCity(edges []GraphEdge, city string) bool {
 	for _, e := range edges {
 		if e.From == city || e.To == city {
@@ -130,6 +151,7 @@ func hasVisitedCity(edges []GraphEdge, city string) bool {
 	return false
 }
 
+// buildItineraryResult consolida as arestas percorridas em uma estrutura ItineraryResult pronta.
 func buildItineraryResult(edges []GraphEdge) ItineraryResult {
 	var segments []ItinerarySegmentDetail
 	var totalPrice float64
@@ -142,10 +164,12 @@ func buildItineraryResult(edges []GraphEdge) ItineraryResult {
 	for _, e := range edges {
 		totalPrice += e.Segment.Price
 
+		// Encontra a menor quantidade de assentos disponíveis no trajeto (gargalo do itinerário)
 		if e.Segment.AvailableSeats < minSeats {
 			minSeats = e.Segment.AvailableSeats
 		}
 
+		// Adiciona o motorista sem duplicatas
 		if !driverSet[e.DriverToken] {
 			driverSet[e.DriverToken] = true
 			drivers = append(drivers, e.DriverToken)
@@ -153,6 +177,7 @@ func buildItineraryResult(edges []GraphEdge) ItineraryResult {
 
 		segments = append(segments, ItinerarySegmentDetail{
 			RideID:         e.Ride.ID,
+			CompanyID:      e.CompanyID,
 			DriverToken:    e.DriverToken,
 			From:           e.Segment.From,
 			To:             e.Segment.To,
