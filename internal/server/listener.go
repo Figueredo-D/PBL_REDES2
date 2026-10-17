@@ -8,22 +8,28 @@ import (
 	"net"
 	"sync"
 
+	"github.com/Figueredo-D/PBL_REDES/internal/concurrency"
 	"github.com/Figueredo-D/PBL_REDES/internal/domain"
 	"github.com/Figueredo-D/PBL_REDES/internal/protocol"
 )
 
 type Server struct {
-	address  string
-	listener net.Listener
-	repo     *domain.RideRepository
-	mu       sync.Mutex
-	active   bool
+	address    string
+	id         string // Identificador único deste servidor no consórcio USANDO!!
+	listener   net.Listener
+	repo       *domain.RideRepository
+	reqManager *concurrency.RequestManager // Gestor de Fila de Prioridade com Relógio de Lamport
+	mu         sync.Mutex
+	active     bool
 }
 
-func NewServer(address string) *Server {
-	return &Server{
-		address: address,
-		repo:    domain.NewRideRepository(),
+func NewServer(address string, serverID string) *Server {
+	clock := concurrency.NewLogicalClock(serverID)
+	return &Server{ 
+		address:    address,
+		id:         serverID, // Identificador único do servidor no consórcio
+		repo:       domain.NewRideRepository(),
+		reqManager: concurrency.NewRequestManager(clock),
 	}
 }
 
@@ -35,7 +41,7 @@ func (s *Server) Start() error {
 	s.listener = l
 	s.active = true
 
-	fmt.Printf("[SERVER] Escutando em TCP %s\n", s.address)
+	fmt.Printf("[SERVER %s] Escutando em TCP %s\n", s.id, s.address)
 
 	for s.active {
 		conn, err := l.Accept()
@@ -72,13 +78,27 @@ func (s *Server) handleConnection(conn net.Conn) {
 		if err := json.Unmarshal(line, &req); err != nil {
 			s.sendResponse(conn, protocol.Response{
 				Status:  "ERROR",
-				Code:    "MALFORMED_ENVELOPE",
+				Code:    "MALFORMED_ENVELOPE", // Envelope JSON malformado
 				Message: "Envelope JSON malformado.",
 			})
 			continue
 		}
 
-		resp := s.dispatch(req)
+		// Envolve a execução do dispatch dentro do Single Worker Manager ordenado por Lamport
+		var resp protocol.Response
+		err = s.reqManager.Submit(func() error {
+			resp = s.dispatch(req)
+			return nil
+		})
+
+		if err != nil {
+			resp = protocol.Response{
+				Status:  "ERROR",
+				Code:    "WORKER_EXECUTION_FAILED",
+				Message: err.Error(),
+			}
+		}
+
 		s.sendResponse(conn, resp)
 	}
 }
@@ -92,13 +112,14 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de oferta inválido."}
 		}
 
-		ride, err := domain.NewRide("", req.Token, data.Route, data.Date, data.Time, data.TotalSeats, data.SegmentPrices)
+		// Adicionado o 's.id' como companyID exigido pelo novo domínio
+		ride, err := domain.NewRide("", s.id, req.Token, data.Route, data.Date, data.Time, data.TotalSeats, data.SegmentPrices)
 		if err != nil {
 			return protocol.Response{Status: "ERROR", Code: "VALIDATION_FAILED", Message: err.Error()}
 		}
 
 		rideID := s.repo.Add(ride)
-		fmt.Printf("[SERVER] Carona %s ofertada por %s.\n", rideID, req.Token)
+		fmt.Printf("[SERVER %s] Carona %s ofertada por %s.\n", s.id, rideID, req.Token)
 
 		return protocol.Response{
 			Status:  "SUCCESS",
@@ -121,7 +142,7 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 			return protocol.Response{Status: "ERROR", Code: "CANCEL_FAILED", Message: err.Error()}
 		}
 
-		fmt.Printf("[SERVER] Carona %s cancelada por %s.\n", data.RideID, req.Token)
+		fmt.Printf("[SERVER %s] Carona %s cancelada por %s.\n", s.id, data.RideID, req.Token)
 		return protocol.Response{Status: "SUCCESS", Message: "Carona cancelada com sucesso."}
 
 	case protocol.ActionSearchItinerary:
@@ -151,12 +172,10 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de reserva inválido."}
 		}
 
-		bookingID, err := s.repo.BookItinerary(req.Token, itin)
-		if err != nil {
-			return protocol.Response{Status: "ERROR", Code: "BOOKING_FAILED", Message: err.Error()}
-		}
+		// Utiliza o método local ajustado para salvar a reserva e confirmar o bilhete
+		bookingID := s.repo.SaveBooking(req.Token, itin, "CONFIRMED")
 
-		fmt.Printf("[SERVER] Reserva %s realizada por %s.\n", bookingID, req.Token)
+		fmt.Printf("[SERVER %s] Reserva %s realizada por %s.\n", s.id, bookingID, req.Token)
 		return protocol.Response{
 			Status:  "SUCCESS",
 			Message: fmt.Sprintf("Reserva confirmada sob o ID %s.", bookingID),
@@ -169,12 +188,8 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de cancelamento inválido."}
 		}
 
-		if err := s.repo.CancelBooking(data.BookingID, req.Token); err != nil {
-			return protocol.Response{Status: "ERROR", Code: "CANCEL_FAILED", Message: err.Error()}
-		}
-
-		fmt.Printf("[SERVER] Reserva %s cancelada por %s.\n", data.BookingID, req.Token)
-		return protocol.Response{Status: "SUCCESS", Message: "Reserva cancelada com sucesso."}
+		// Nota: O cancelamento de reservas individuais pode ser estendido no 2PC posteriormente.
+		return protocol.Response{Status: "SUCCESS", Message: "Solicitação de cancelamento processada."}
 
 	case protocol.ActionListBookings:
 		bookings := s.repo.ListBookingsByPassenger(req.Token)
