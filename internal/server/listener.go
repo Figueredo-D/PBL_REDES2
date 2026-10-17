@@ -88,7 +88,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		// Envolve a execução do dispatch dentro do Single Worker Manager ordenado por Lamport
 		var resp protocol.Response
 		err = s.reqManager.Submit(func() error {
 			resp = s.dispatch(req)
@@ -154,13 +153,36 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de busca inválido."}
 		}
 
+		// Cria repositório temporário unificado preservando os IDs e vagas originais
+		tempRepo := domain.NewRideRepository()
+
+		for _, r := range s.repo.ListByDate(data.Date) {
+			tempRepo.AddWithID(r)
+		}
+
+		for peerID := range s.clusterManager.Peers {
+			resp, err := s.clusterManager.SendMessage(peerID, protocol.Request{
+				Action: "INTERNAL_LIST_RIDES_BY_DATE",
+				Token:  req.Token,
+				Data:   fmt.Sprintf(`{"date":"%s"}`, data.Date),
+			})
+			if err == nil && resp.Status == "SUCCESS" {
+				var peerRides []*domain.Ride
+				if json.Unmarshal([]byte(resp.Data), &peerRides) == nil {
+					for _, r := range peerRides {
+						tempRepo.AddWithID(r)
+					}
+				}
+			}
+		}
+
 		filter := domain.SearchFilter{
 			Origin:      data.Origin,
 			Destination: data.Destination,
 			Date:        data.Date,
 		}
 
-		itineraries := s.repo.SearchItineraries(filter)
+		itineraries := tempRepo.SearchItineraries(filter)
 		jsonResult, _ := json.Marshal(itineraries)
 
 		return protocol.Response{
@@ -168,6 +190,16 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 			Message: fmt.Sprintf("Encontradas %d opção(ões).", len(itineraries)),
 			Data:    string(jsonResult),
 		}
+
+	case "INTERNAL_LIST_RIDES_BY_DATE":
+		var data struct {
+			Date string `json:"date"`
+		}
+		json.Unmarshal([]byte(req.Data), &data)
+		
+		rides := s.repo.ListByDate(data.Date)
+		bytes, _ := json.Marshal(rides)
+		return protocol.Response{Status: "SUCCESS", Data: string(bytes)}
 
 	case protocol.ActionBookItinerary:
 		var itin domain.ItineraryResult
@@ -180,44 +212,47 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		votedPeers := []string{}
 		successPrepare := true
 
+		// 1. Tenta reservar os segmentos locais pertencentes a este nó
 		for _, seg := range itin.Segments {
 			_, isLocal := s.repo.GetRide(seg.RideID)
-
 			if isLocal {
 				err := s.repo.TryReserveLocalSegment(seg.RideID, seg.From, seg.To)
 				if err != nil {
 					successPrepare = false
 					break
 				}
-			} else {
-				targetServerID := seg.DriverToken // Identifica o nó dono do segmento
+			}
+		}
 
-				var protoSegments []protocol.SegmentInfo
-				for _, sSeg := range itin.Segments {
-					protoSegments = append(protoSegments, protocol.SegmentInfo{
-						RideID:         sSeg.RideID,
-						DriverToken:    sSeg.DriverToken,
-						From:           sSeg.From,
-						To:             sSeg.To,
-						DepartureTime:  sSeg.DepartureTime,
-						Price:          sSeg.Price,
-						AvailableSeats: sSeg.AvailableSeats,
-					})
-				}
-
-				preparePayload, _ := json.Marshal(protocol.TwoPCPrepareData{
-					TransactionID: transactionID,
-					Itinerary: protocol.ItineraryOption{
-						ItineraryID:    itin.ItineraryID,
-						Segments:       protoSegments,
-						TotalPrice:     itin.TotalPrice,
-						DepartureTime:  itin.DepartureTime,
-						AvailableSeats: itin.AvailableSeats,
-						Drivers:        itin.Drivers,
-					},
+		// 2. Se os locais passaram, envia 2PC_PREPARE para todos os peers do consórcio
+		if successPrepare {
+			var protoSegments []protocol.SegmentInfo
+			for _, sSeg := range itin.Segments {
+				protoSegments = append(protoSegments, protocol.SegmentInfo{
+					RideID:         sSeg.RideID,
+					DriverToken:    sSeg.DriverToken,
+					From:           sSeg.From,
+					To:             sSeg.To,
+					DepartureTime:  sSeg.DepartureTime,
+					Price:          sSeg.Price,
+					AvailableSeats: sSeg.AvailableSeats,
 				})
+			}
 
-				resp, err := s.clusterManager.SendMessage(targetServerID, protocol.Request{
+			preparePayload, _ := json.Marshal(protocol.TwoPCPrepareData{
+				TransactionID: transactionID,
+				Itinerary: protocol.ItineraryOption{
+					ItineraryID:    itin.ItineraryID,
+					Segments:       protoSegments,
+					TotalPrice:     itin.TotalPrice,
+					DepartureTime:  itin.DepartureTime,
+					AvailableSeats: itin.AvailableSeats,
+					Drivers:        itin.Drivers,
+				},
+			})
+
+			for peerID := range s.clusterManager.Peers {
+				resp, err := s.clusterManager.SendMessage(peerID, protocol.Request{
 					Action: protocol.Action2PCPrepare,
 					Token:  req.Token,
 					Data:   string(preparePayload),
@@ -227,7 +262,7 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 					successPrepare = false
 					break
 				}
-				votedPeers = append(votedPeers, targetServerID)
+				votedPeers = append(votedPeers, peerID)
 			}
 		}
 

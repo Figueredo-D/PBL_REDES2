@@ -61,37 +61,59 @@ func (c *Client) Close() {
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 
-	fmt.Println("==================================================")
-	fmt.Println("        SISTEMA DE CARONAS - MOTORISTA            ")
-	fmt.Println("==================================================")
-	fmt.Print("Digite seu Token de Motorista: ")
+	fmt.Println("================================================================")
+	fmt.Println("            SISTEMA DE CARONAS DISTRIBUÍDO - MOTORISTA          ")
+	fmt.Println("================================================================")
+	
+	fmt.Print(" Digite seu Token de Motorista: ")
 	scanner.Scan()
 	driverToken := strings.TrimSpace(scanner.Text())
 	if driverToken == "" {
 		driverToken = "driver_default"
 	}
 
-	serverHost := os.Getenv("SERVER_HOST")
-	if serverHost == "" {
-		serverHost = "localhost"
+	// Menu interativo para escolha do servidor
+	fmt.Println("\n----------------------------------------------------------------")
+	fmt.Println("                 SELECIONE O NÓ DO CONSÓRCIO                    ")
+	fmt.Println("----------------------------------------------------------------")
+	fmt.Println("  [1] Servidor A  (Porta 8080)")
+	fmt.Println("  [2] Servidor B  (Porta 8081)")
+	fmt.Println("  [3] Servidor C  (Porta 8082)")
+	fmt.Print(" Escolha o servidor (1-3): ")
+
+	scanner.Scan()
+	nodeChoice := strings.TrimSpace(scanner.Text())
+
+	var serverAddr string
+	switch nodeChoice {
+	case "2":
+		serverAddr = "localhost:8081"
+	case "3":
+		serverAddr = "localhost:8082"
+	case "1":
+		fallthrough
+	default:
+		serverAddr = "localhost:8080"
 	}
 
-	client, err := NewClient(serverHost + ":8080")
+	client, err := NewClient(serverAddr)
 	if err != nil {
-		fmt.Printf("[ERRO] Não foi possível conectar ao servidor (%s:8080): %v\n", serverHost, err)
+		fmt.Printf("\n[ ERRO DE CONEXÃO] Não foi possível conectar ao nó em (%s): %v\n", serverAddr, err)
 		os.Exit(1)
 	}
 	defer client.Close()
 
+	fmt.Printf("[ CONECTADO] Motorista [%s] conectado com sucesso ao nó: %s\n", driverToken, serverAddr)
+
 	for {
-		fmt.Println("\n--------------------------------------------------")
-		fmt.Printf("   PAINEL DO MOTORISTA | Usuário: [%s]\n", driverToken)
-		fmt.Println("--------------------------------------------------")
-		fmt.Println("  [1] Ofertar Nova Carona")
-		fmt.Println("  [2] Minhas Caronas Cadastradas")
-		fmt.Println("  [3] Cancelar uma Carona")
-		fmt.Println("  [0] Sair")
-		fmt.Print("Escolha uma opção: ")
+		fmt.Println("\n----------------------------------------------------------------")
+		fmt.Printf("   PAINEL DO MOTORISTA  |  Usuário: [%s]  |  Nó: [%s]\n", driverToken, serverAddr)
+		fmt.Println("----------------------------------------------------------------")
+		fmt.Println("  [1]  Ofertar Nova Carona")
+		fmt.Println("  [2]  Minhas Caronas Cadastradas")
+		fmt.Println("  [3]  Cancelar uma Carona")
+		fmt.Println("  [0]  Sair")
+		fmt.Print(" Escolha uma opção: ")
 
 		scanner.Scan()
 		option := strings.TrimSpace(scanner.Text())
@@ -104,20 +126,20 @@ func main() {
 		case "3":
 			handleCancelRide(client, scanner, driverToken)
 		case "0":
-			fmt.Println("\nSaindo...")
+			fmt.Println("\n A encerrar sessão do motorista...")
 			return
 		default:
-			fmt.Println("\n[!] Opção inválida.")
+			fmt.Println("\n[!] Opção inválida. Tente novamente.")
 		}
 	}
 }
 
 func handleOfferRide(client *Client, scanner *bufio.Scanner, token string) {
-	fmt.Println("\n==================================================")
-	fmt.Println("             CADASTRAR CARONA                     ")
-	fmt.Println("==================================================")
+	fmt.Println("\n================================================================")
+	fmt.Println("                   CADASTRAR NOVA CARONA                        ")
+	fmt.Println("================================================================")
 
-	fmt.Print("Cidades da rota (separadas por vírgula): ")
+	fmt.Print(" Cidades da rota (separadas por vírgula, ex: Feira, Salvador): ")
 	scanner.Scan()
 	rawCities := strings.Split(scanner.Text(), ",")
 	var route []string
@@ -129,36 +151,36 @@ func handleOfferRide(client *Client, scanner *bufio.Scanner, token string) {
 	}
 
 	if len(route) < 2 {
-		fmt.Println("[ERRO] A rota deve ter pelo menos 2 cidades.")
+		fmt.Println("[ ERRO] A rota deve conter pelo menos 2 cidades (Origem e Destino).")
 		return
 	}
 
-	fmt.Print("Data (AAAA-MM-DD): ")
+	fmt.Print(" Data da viagem (AAAA-MM-DD): ")
 	scanner.Scan()
 	date := strings.TrimSpace(scanner.Text())
 
-	fmt.Print("Horário de Saída (HH:MM): ")
+	fmt.Print(" Horário de Saída (HH:MM): ")
 	scanner.Scan()
 	timeStr := strings.TrimSpace(scanner.Text())
 
-	fmt.Print("Quantidade de Assentos: ")
+	fmt.Print("💺 Quantidade total de assentos disponíveis: ")
 	scanner.Scan()
 	seats, err := strconv.Atoi(strings.TrimSpace(scanner.Text()))
 	if err != nil || seats <= 0 {
-		fmt.Println("[ERRO] Assentos inválidos.")
+		fmt.Println("[ ERRO] Quantidade de assentos inválida.")
 		return
 	}
 
 	numSegments := len(route) - 1
 	var prices []float64
-	fmt.Printf("\nPreço individual dos %d trechos:\n", numSegments)
+	fmt.Printf("\n Informe o preço individual para cada um dos %d trechos:\n", numSegments)
 
 	for i := 0; i < numSegments; i++ {
-		fmt.Printf(" Trecho %s -> %s (R$): ", route[i], route[i+1])
+		fmt.Printf("   Trecho [%s ➔ %s] (R$): ", route[i], route[i+1])
 		scanner.Scan()
 		price, err := strconv.ParseFloat(strings.TrimSpace(scanner.Text()), 64)
 		if err != nil || price <= 0 {
-			fmt.Println("[ERRO] Preço inválido.")
+			fmt.Println("[ ERRO] Preço inválido. Operação cancelada.")
 			return
 		}
 		prices = append(prices, price)
@@ -174,21 +196,21 @@ func handleOfferRide(client *Client, scanner *bufio.Scanner, token string) {
 
 	resp, err := client.Send(protocol.ActionOfferRide, token, offerPayload)
 	if err != nil {
-		fmt.Printf("[ERRO TCP]: %v\n", err)
+		fmt.Printf("[ ERRO TCP]: %v\n", err)
 		return
 	}
 
 	if resp.Status == "SUCCESS" {
-		fmt.Printf("\n[SUCESSO] %s\n", resp.Message)
+		fmt.Printf("\n[ SUCESSO] %s\n", resp.Message)
 	} else {
-		fmt.Printf("\n[FALHA] [%s] %s\n", resp.Code, resp.Message)
+		fmt.Printf("\n[ FALHA] [%s] %s\n", resp.Code, resp.Message)
 	}
 }
 
 func handleListRides(client *Client, token string) {
 	resp, err := client.Send(protocol.ActionListRides, token, nil)
 	if err != nil || resp.Status != "SUCCESS" {
-		fmt.Println("\n[ERRO] Não foi possível consultar suas caronas.")
+		fmt.Println("\n[ ERRO] Não foi possível consultar as suas caronas cadastradas.")
 		return
 	}
 
@@ -196,7 +218,7 @@ func handleListRides(client *Client, token string) {
 	json.Unmarshal([]byte(resp.Data), &rides)
 
 	if len(rides) == 0 {
-		fmt.Println("\nNenhuma carona cadastrada.")
+		fmt.Println("\n Nenhuma carona cadastrada no seu perfil neste nó.")
 		return
 	}
 
@@ -204,7 +226,7 @@ func handleListRides(client *Client, token string) {
 	fmt.Println("                               MINHAS CARONAS OFERTADAS                                   ")
 	fmt.Println("==========================================================================================")
 	for _, ride := range rides {
-		fmt.Printf("\n  ID DA CARONA: %s  |  Data: %s  |  Saída: %s hrs  |  Vagas Totais: %d\n",
+		fmt.Printf("\n  ID DA CARONA: %s  |   Data: %s  |   Saída: %s hrs  |   Vagas Totais: %d\n",
 			ride.ID, ride.Date, ride.Time, ride.TotalSeats)
 
 		fmt.Println("  +----+------------------------+------------------------+----------+-------------------+")
@@ -221,7 +243,7 @@ func handleListRides(client *Client, token string) {
 func handleCancelRide(client *Client, scanner *bufio.Scanner, token string) {
 	handleListRides(client, token)
 
-	fmt.Print("\nDigite o ID da Carona que deseja CANCELAR (ex: RIDE_0001): ")
+	fmt.Print("\n Digite o ID exato da Carona que deseja CANCELAR (ex: RIDE_0001): ")
 	scanner.Scan()
 	rideID := strings.TrimSpace(scanner.Text())
 
@@ -233,14 +255,14 @@ func handleCancelRide(client *Client, scanner *bufio.Scanner, token string) {
 	resp, err := client.Send(protocol.ActionCancelRide, token, cancelPayload)
 
 	if err != nil {
-		fmt.Printf("\n[ERRO TCP]: %v\n", err)
+		fmt.Printf("\n[ ERRO TCP]: %v\n", err)
 		return
 	}
 
 	if resp.Status == "SUCCESS" {
-		fmt.Printf("\n[SUCESSO] %s\n", resp.Message)
+		fmt.Printf("\n[ SUCESSO] %s\n", resp.Message)
 	} else {
-		fmt.Printf("\n[FALHA] [%s] %s\n", resp.Code, resp.Message)
+		fmt.Printf("\n[ FALHA] [%s] %s\n", resp.Code, resp.Message)
 	}
 }
 

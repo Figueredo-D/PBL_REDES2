@@ -1,9 +1,5 @@
 package domain
 
-import (
-	"time"
-)
-
 // SearchFilter representa os parâmetros informados pelo passageiro na busca de itinerários.
 type SearchFilter struct {
 	Origin      string `json:"origin"`
@@ -12,7 +8,6 @@ type SearchFilter struct {
 }
 
 // ItinerarySegmentDetail descreve detalhadamente um trecho do itinerário gerado na busca.
-// É essencial incluir CompanyID para saber a qual servidor do consórcio este trecho pertence.
 type ItinerarySegmentDetail struct {
 	RideID         string  `json:"ride_id"`        // ID da carona correspondente
 	CompanyID      string  `json:"company_id"`     // Empresa responsável por este trecho (utilizado no 2PC)
@@ -54,7 +49,6 @@ type PathNode struct {
 // todas as combinações de trajetos possíveis (diretos ou com conexão) que atendam ao filtro.
 func FindItineraries(rides []*Ride, filter SearchFilter) []ItineraryResult {
 	var results []ItineraryResult
-	now := time.Now()
 
 	// Cria o adjacency list do Grafo mapeando: CidadeOrigem -> []ArestasDisponíveis
 	graph := make(map[string][]GraphEdge)
@@ -63,14 +57,6 @@ func FindItineraries(rides []*Ride, filter SearchFilter) []ItineraryResult {
 		// Ignora caronas de datas diferentes da buscada
 		if ride.Date != filter.Date {
 			continue
-		}
-
-		// Se a carona for para hoje, ignora caronas cujo horário de partida já passou
-		if ride.Date == now.Format("2006-01-02") {
-			departureDateTime, err := time.Parse("2006-01-02 15:04", ride.Date+" "+ride.Time)
-			if err == nil && departureDateTime.Before(now) {
-				continue
-			}
 		}
 
 		// Leitura concorrencial segura usando a trava fina de leitura da carona
@@ -117,8 +103,8 @@ func FindItineraries(rides []*Ride, filter SearchFilter) []ItineraryResult {
 				continue
 			}
 
-			// Validação temporal das conexões: em viagens combinadas com caronas diferentes,
-			// a segunda carona não pode partir antes do horário da primeira carona
+			// Validação temporal das conexões: 
+			// A segunda carona não pode partir antes da primeira carona
 			if len(current.Edges) > 0 {
 				lastEdge := current.Edges[len(current.Edges)-1]
 				if edge.Ride.ID != lastEdge.Ride.ID && edge.Ride.Time < lastEdge.Ride.Time {

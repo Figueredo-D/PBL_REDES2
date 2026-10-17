@@ -61,37 +61,59 @@ func (c *Client) Close() {
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 
-	fmt.Println("==================================================")
-	fmt.Println("        SISTEMA DE CARONAS - PASSAGEIRO           ")
-	fmt.Println("==================================================")
-	fmt.Print("Digite seu Token de Passageiro: ")
+	fmt.Println("================================================================")
+	fmt.Println("           SISTEMA DE CARONAS DISTRIBUÍDO - PASSAGEIRO          ")
+	fmt.Println("================================================================")
+	
+	fmt.Print(" Digite seu Token de Passageiro: ")
 	scanner.Scan()
 	passengerToken := strings.TrimSpace(scanner.Text())
 	if passengerToken == "" {
 		passengerToken = "passageiro_default"
 	}
 
-	serverHost := os.Getenv("SERVER_HOST")
-	if serverHost == "" {
-		serverHost = "localhost"
+	// Menu interativo para escolha do servidor
+	fmt.Println("\n----------------------------------------------------------------")
+	fmt.Println("                 SELECIONE O NÓ DO CONSÓRCIO                    ")
+	fmt.Println("----------------------------------------------------------------")
+	fmt.Println("  [1] Servidor A  (Porta 8080)")
+	fmt.Println("  [2] Servidor B  (Porta 8081)")
+	fmt.Println("  [3] Servidor C  (Porta 8082)")
+	fmt.Print(" Escolha o servidor (1-3): ")
+
+	scanner.Scan()
+	nodeChoice := strings.TrimSpace(scanner.Text())
+
+	var serverAddr string
+	switch nodeChoice {
+	case "2":
+		serverAddr = "localhost:8081"
+	case "3":
+		serverAddr = "localhost:8082"
+	case "1":
+		fallthrough
+	default:
+		serverAddr = "localhost:8080"
 	}
 
-	client, err := NewClient(serverHost + ":8080")
+	client, err := NewClient(serverAddr)
 	if err != nil {
-		fmt.Printf("\n[ERRO CONEXÃO] Não foi possível conectar ao servidor (%s:8080): %v\n", serverHost, err)
+		fmt.Printf("\n[ ERRO DE CONEXÃO] Não foi possível conectar ao nó em (%s): %v\n", serverAddr, err)
 		os.Exit(1)
 	}
 	defer client.Close()
 
+	fmt.Printf("[ CONECTADO] Passageiro [%s] conectado com sucesso ao nó: %s\n", passengerToken, serverAddr)
+
 	for {
-		fmt.Println("\n--------------------------------------------------")
-		fmt.Printf("   PAINEL DO PASSAGEIRO | Usuário: [%s]\n", passengerToken)
-		fmt.Println("--------------------------------------------------")
-		fmt.Println("  [1] Consultar e Reservar Itinerários (BFS)")
-		fmt.Println("  [2] Minhas Reservas")
-		fmt.Println("  [3] Cancelar uma Reserva")
-		fmt.Println("  [0] Sair")
-		fmt.Print("Escolha uma opção: ")
+		fmt.Println("\n----------------------------------------------------------------")
+		fmt.Printf("   PAINEL DO PASSAGEIRO | Usuário: [%s]  |  Nó: [%s]\n", passengerToken, serverAddr)
+		fmt.Println("----------------------------------------------------------------")
+		fmt.Println("  [1]  Consultar e Reservar Itinerários (BFS / 2PC)")
+		fmt.Println("  [2]  Minhas Reservas Efetuadas")
+		fmt.Println("  [3]  Cancelar uma Reserva")
+		fmt.Println("  [0]  Sair")
+		fmt.Print(" Escolha uma opção: ")
 
 		scanner.Scan()
 		option := strings.TrimSpace(scanner.Text())
@@ -104,28 +126,28 @@ func main() {
 		case "3":
 			handleCancelBooking(client, scanner, passengerToken)
 		case "0":
-			fmt.Println("\nSaindo...")
+			fmt.Println("\n A encerrar sessão do passageiro...")
 			return
 		default:
-			fmt.Println("\n[!] Opção inválida.")
+			fmt.Println("\n[!] Opção inválida. Tente novamente.")
 		}
 	}
 }
 
 func handleSearchAndBook(client *Client, scanner *bufio.Scanner, token string) {
-	fmt.Println("\n==================================================")
-	fmt.Println("             CONSULTAR VIAGENS                   ")
-	fmt.Println("==================================================")
+	fmt.Println("\n================================================================")
+	fmt.Println("                     CONSULTAR ITINERÁRIOS                      ")
+	fmt.Println("================================================================")
 
-	fmt.Print("Origem: ")
+	fmt.Print(" Cidade de Origem: ")
 	scanner.Scan()
 	origin := strings.TrimSpace(scanner.Text())
 
-	fmt.Print("Destino: ")
+	fmt.Print(" Cidade de Destino: ")
 	scanner.Scan()
 	destination := strings.TrimSpace(scanner.Text())
 
-	fmt.Print("Data (AAAA-MM-DD): ")
+	fmt.Print(" Data da Viagem (AAAA-MM-DD): ")
 	scanner.Scan()
 	date := strings.TrimSpace(scanner.Text())
 
@@ -137,7 +159,7 @@ func handleSearchAndBook(client *Client, scanner *bufio.Scanner, token string) {
 
 	resp, err := client.Send(protocol.ActionSearchItinerary, token, searchPayload)
 	if err != nil || resp.Status != "SUCCESS" {
-		fmt.Printf("\n[ERRO]: %s\n", resp.Message)
+		fmt.Printf("\n[ ERRO]: %s\n", resp.Message)
 		return
 	}
 
@@ -145,25 +167,25 @@ func handleSearchAndBook(client *Client, scanner *bufio.Scanner, token string) {
 	json.Unmarshal([]byte(resp.Data), &itineraries)
 
 	if len(itineraries) == 0 {
-		fmt.Println("\nNenhum itinerário encontrado para essa data/rota.")
+		fmt.Println("\n Nenhum itinerário direto ou combinado encontrado para esta rota nesta data.")
 		return
 	}
 
 	fmt.Printf("\n========================================================================================\n")
-	fmt.Printf("               ITINERÁRIOS ENCONTRADOS (%d OPÇÕES)                                      \n", len(itineraries))
+	fmt.Printf("               ITINERÁRIOS ENCONTRADOS (%d OPÇÕES DISPONÍVEIS)                          \n", len(itineraries))
 	fmt.Printf("========================================================================================\n")
 
 	for idx, itin := range itineraries {
 		tipo := "DIRETA"
 		if len(itin.Drivers) > 1 {
-			tipo = fmt.Sprintf("COMBINADA (%d TROCAS)", len(itin.Drivers)-1)
+			tipo = fmt.Sprintf("COMBINADA (%d TROCAS/TRECHOS)", len(itin.Drivers))
 		}
 
 		fmt.Printf("\n+--------------------------------------------------------------------------------------+\n")
-		fmt.Printf("  OPÇÃO #%d  |  Tipo: %s\n", idx+1, tipo)
-		fmt.Printf("  Saída: %s hrs  |  Vagas Livres: %d  |  PREÇO TOTAL: R$ %.2f\n",
+		fmt.Printf("   OPÇÃO #%d  |  Tipo: %s\n", idx+1, tipo)
+		fmt.Printf("   Saída: %s hrs  |   Vagas Livres: %d  |   PREÇO TOTAL: R$ %.2f\n",
 			itin.DepartureTime, itin.AvailableSeats, itin.TotalPrice)
-		fmt.Printf("  Motoristas: %s\n", strings.Join(itin.Drivers, " -> "))
+		fmt.Printf("   Motoristas envolvidos: %s\n", strings.Join(itin.Drivers, " ➔ "))
 		fmt.Printf("+--------------------------------------------------------------------------------------+ \n")
 
 		fmt.Println("  +----+------------------------+------------------------+-------------------+----------+---------+")
@@ -176,32 +198,32 @@ func handleSearchAndBook(client *Client, scanner *bufio.Scanner, token string) {
 		fmt.Println("  +----+------------------------+------------------------+-------------------+----------+---------+")
 	}
 
-	fmt.Print("\nDeseja reservar alguma opção acima? (Digite o número da opção 1..N ou 0 para cancelar): ")
+	fmt.Print("\n Deseja reservar alguma opção acima? (Digite o número da opção 1..N ou 0 para cancelar): ")
 	scanner.Scan()
 	choice, err := strconv.Atoi(strings.TrimSpace(scanner.Text()))
 	if err != nil || choice < 1 || choice > len(itineraries) {
-		fmt.Println("Operação cancelada.")
+		fmt.Println(" Operação de reserva cancelada.")
 		return
 	}
 
 	selectedItin := itineraries[choice-1]
 	bookResp, err := client.Send(protocol.ActionBookItinerary, token, selectedItin)
 	if err != nil {
-		fmt.Printf("\n[ERRO TCP]: %v\n", err)
+		fmt.Printf("\n[ ERRO TCP]: %v\n", err)
 		return
 	}
 
 	if bookResp.Status == "SUCCESS" {
-		fmt.Printf("\n[SUCESSO] %s\n", bookResp.Message)
+		fmt.Printf("\n[ SUCESSO NO 2PC] %s\n", bookResp.Message)
 	} else {
-		fmt.Printf("\n[FALHA] [%s] %s\n", bookResp.Code, bookResp.Message)
+		fmt.Printf("\n[ FALHA NA TRANSAÇÃO] [%s] %s\n", bookResp.Code, bookResp.Message)
 	}
 }
 
 func handleListBookings(client *Client, token string) {
 	resp, err := client.Send(protocol.ActionListBookings, token, nil)
 	if err != nil || resp.Status != "SUCCESS" {
-		fmt.Println("\n[ERRO] Não foi possível carregar reservas.")
+		fmt.Println("\n[ ERRO] Não foi possível carregar as suas reservas.")
 		return
 	}
 
@@ -209,15 +231,15 @@ func handleListBookings(client *Client, token string) {
 	json.Unmarshal([]byte(resp.Data), &bookings)
 
 	if len(bookings) == 0 {
-		fmt.Println("\nNenhuma reserva encontrada.")
+		fmt.Println("\n Nenhuma reserva encontrada no seu histórico.")
 		return
 	}
 
 	fmt.Println("\n==========================================================================================")
-	fmt.Println("                                MINHAS RESERVAS                                           ")
+	fmt.Println("                                MINHAS RESERVAS EFETUADAS                                 ")
 	fmt.Println("==========================================================================================")
 	for _, b := range bookings {
-		fmt.Printf("\n  ID DA RESERVA: %s  |  Status: %s  |  Data da Reserva: %s  |  Valor Total: R$ %.2f\n",
+		fmt.Printf("\n   ID DA RESERVA: %s  |   Status: %s  |   Data: %s  |   Valor Total: R$ %.2f\n",
 			b.ID, b.Status, b.Date, b.Itinerary.TotalPrice)
 
 		fmt.Println("  +----+------------------------+------------------------+-------------------+----------+---------+")
@@ -234,7 +256,7 @@ func handleListBookings(client *Client, token string) {
 func handleCancelBooking(client *Client, scanner *bufio.Scanner, token string) {
 	handleListBookings(client, token)
 
-	fmt.Print("\nDigite o ID da Reserva que deseja CANCELAR (ex: BOOK_0001): ")
+	fmt.Print("\n Digite o ID exato da Reserva que deseja CANCELAR (ex: BOOK_0001): ")
 	scanner.Scan()
 	bookingID := strings.TrimSpace(scanner.Text())
 
@@ -246,15 +268,22 @@ func handleCancelBooking(client *Client, scanner *bufio.Scanner, token string) {
 	resp, err := client.Send(protocol.ActionCancelBooking, token, cancelPayload)
 
 	if err != nil {
-		fmt.Printf("\n[ERRO TCP]: %v\n", err)
+		fmt.Printf("\n[ ERRO TCP]: %v\n", err)
 		return
 	}
 
 	if resp.Status == "SUCCESS" {
-		fmt.Printf("\n[SUCESSO] %s\n", resp.Message)
+		fmt.Printf("\n[ SUCESSO] %s\n", resp.Message)
 	} else {
-		fmt.Printf("\n[FALHA] [%s] %s\n", resp.Code, resp.Message)
+		fmt.Printf("\n[ FALHA] [%s] %s\n", bookRespCodeOrGeneric(resp.Code), resp.Message)
 	}
+}
+
+func bookRespCodeOrGeneric(code string) string {
+	if code == "" {
+		return "ERROR"
+	}
+	return code
 }
 
 func truncate(str string, max int) string {

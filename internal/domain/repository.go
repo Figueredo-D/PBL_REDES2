@@ -44,6 +44,13 @@ func (r *RideRepository) Add(ride *Ride) string {
 	return ride.ID
 }
 
+// AddWithID insere uma carona mantendo o seu ID original (usado para caronas remotas do consórcio na busca unificada).
+func (r *RideRepository) AddWithID(ride *Ride) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rides[ride.ID] = ride
+}
+
 // GetRide busca uma carona local pelo seu ID.
 func (r *RideRepository) GetRide(rideID string) (*Ride, bool) {
 	r.mu.RLock()
