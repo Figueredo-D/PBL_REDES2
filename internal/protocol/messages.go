@@ -9,6 +9,11 @@ const (
 	ActionBookItinerary   = "BOOK_ITINERARY"
 	ActionCancelBooking   = "CANCEL_BOOKING"
 	ActionListBookings    = "LIST_BOOKINGS"
+
+	// Novas ações para o protocolo Two-Phase Commit (2PC) entre os nós do consórcio
+	Action2PCPrepare = "2PC_PREPARE"
+	Action2PCCommit  = "2PC_COMMIT"
+	Action2PCAbort   = "2PC_ABORT"
 )
 
 type Request struct {
@@ -18,7 +23,7 @@ type Request struct {
 }
 
 type Response struct {
-	Status  string `json:"status"`
+	Status  string `json:"status"` // "SUCCESS", "ERROR", "VOTE_COMMIT", "VOTE_ABORT"
 	Code    string `json:"code,omitempty"`
 	Message string `json:"message,omitempty"`
 	Data    string `json:"data,omitempty"`
@@ -51,6 +56,12 @@ type CancelBookingData struct {
 	BookingID string `json:"booking_id"`
 }
 
+// Payload específico para a Fase 1 do 2PC (Prepare)
+type TwoPCPrepareData struct {
+	TransactionID string          `json:"transaction_id"`
+	Itinerary     ItineraryOption `json:"itinerary"`
+}
+
 type SegmentInfo struct {
 	RideID         string  `json:"ride_id"`
 	DriverToken    string  `json:"driver_token"`
@@ -71,9 +82,9 @@ type ItineraryOption struct {
 }
 
 type Booking struct {
-	ID             string        `json:"id"`
-	PassengerToken string        `json:"passenger_token"`
+	ID             string          `json:"id"`
+	PassengerToken string          `json:"passenger_token"`
 	Itinerary      ItineraryOption `json:"itinerary"`
-	Date           string        `json:"date"`
-	Status         string        `json:"status"` // "CONFIRMED", "CANCELLED"
+	Date           string          `json:"date"`
+	Status         string          `json:"status"` // "CONFIRMED", "CANCELLED"
 }

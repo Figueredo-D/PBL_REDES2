@@ -9,23 +9,52 @@ import (
 )
 
 func main() {
-	// Valida se os parâmetros obrigatórios (ID do Servidor e Porta) foram fornecidos
-	// Exemplo de execução: go run cmd/server/main.go SERVER_A :8080
-	if len(os.Args) < 3 {
+	// Verifica se o ID do servidor foi passado por argumento
+	if len(os.Args) < 2 {
 		fmt.Println("Uso incorreto!")
-		fmt.Println("Uso correto: go run cmd/server/main.go <SERVER_ID> <PORTA>")
-		fmt.Println("Exemplo: go run cmd/server/main.go SERVER_A :8080")
+		fmt.Println("Uso correto: go run cmd/server/main.go <SERVER_ID>")
+		fmt.Println("Exemplos: ")
+		fmt.Println("  go run cmd/server/main.go SERVER_A")
+		fmt.Println("  go run cmd/server/main.go SERVER_B")
+		fmt.Println("  go run cmd/server/main.go SERVER_C")
 		os.Exit(1)
 	}
 
-	// Captura os argumentos da linha de comando
-	serverID := os.Args[1] // Identificador único do nó (ex: SERVER_A, SERVER_B, etc.)
-	port := os.Args[2]     // Porta TCP onde o servidor irá escutar (ex: :8080)
+	serverID := os.Args[1]
 
-	// Inicializa o servidor passando a porta e o ID para configurar o Relógio de Lamport e a Fila
-	srv := server.NewServer(port, serverID)
+	// Mapeamento fixo de portas para cada nó do consórcio
+	ports := map[string]string{
+		"SERVER_A": ":8080",
+		"SERVER_B": ":8081",
+		"SERVER_C": ":8082",
+	}
 
-	// Inicia o listener TCP e o worker loop de requisições sequenciais
+	// Mapeamento fixo dos vizinhos (peers) para cada nó
+	allPeers := map[string]map[string]string{
+		"SERVER_A": {
+			"SERVER_B": "localhost:8081",
+			"SERVER_C": "localhost:8082",
+		},
+		"SERVER_B": {
+			"SERVER_A": "localhost:8080",
+			"SERVER_C": "localhost:8082",
+		},
+		"SERVER_C": {
+			"SERVER_A": "localhost:8080",
+			"SERVER_B": "localhost:8081",
+		},
+	}
+
+	port, portExists := ports[serverID]
+	peers, peersExist := allPeers[serverID]
+
+	if !portExists || !peersExist {
+		log.Fatalf("[FATAL] ID de servidor inválido: '%s'. Utilize SERVER_A, SERVER_B ou SERVER_C.", serverID)
+	}
+
+	// Inicializa o servidor com a porta fixa, o ID e o mapa de peers configurados
+	srv := server.NewServer(port, serverID, peers)
+
 	if err := srv.Start(); err != nil {
 		log.Fatalf("[FATAL] Erro ao rodar o servidor %s: %v", serverID, err)
 	}
