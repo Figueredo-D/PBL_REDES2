@@ -3,11 +3,13 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"time"
 
 	"github.com/Figueredo-D/PBL_REDES/internal/domain"
+	"github.com/Figueredo-D/PBL_REDES/internal/protocol"
 )
 
 // apiError é o formato padrão de erro da API interna, conforme o contrato em docs.
@@ -42,6 +44,9 @@ type internalRideDTO struct {
 func (s *Server) StartInternalHTTP(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/rides", s.handleInternalRides)
+	mux.HandleFunc("/internal/prepare", s.handleInternal2PC(protocol.Action2PCPrepare))
+	mux.HandleFunc("/internal/commit", s.handleInternal2PC(protocol.Action2PCCommit))
+	mux.HandleFunc("/internal/abort", s.handleInternal2PC(protocol.Action2PCAbort))
 
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -85,6 +90,50 @@ func (s *Server) handleInternalRides(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeAPIJSON(w, http.StatusOK, out)
+}
+
+// handleInternal2PC implementa POST /internal/prepare, /internal/commit e /internal/abort.
+// A requisição passa pelo mesmo Single Worker usado pelo TCP, então a lógica de participante
+// continua em um único lugar (o dispatch) e a ordem de processamento permanece única.
+func (s *Server) handleInternal2PC(action string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeAPIError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "use o método POST")
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "INVALID_DATA", "não foi possível ler o corpo da requisição")
+			return
+		}
+
+		var resp protocol.Response
+		err = s.reqManager.Submit(func() error {
+			resp = s.dispatch(protocol.Request{Action: action, Data: string(body)})
+			return nil
+		})
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "WORKER_EXECUTION_FAILED", err.Error())
+			return
+		}
+
+		if action == protocol.Action2PCPrepare {
+			if resp.Status == "VOTE_COMMIT" {
+				writeAPIJSON(w, http.StatusOK, resp)
+				return
+			}
+			writeAPIJSON(w, http.StatusConflict, resp)
+			return
+		}
+
+		if resp.Status != "SUCCESS" {
+			writeAPIJSON(w, http.StatusBadRequest, resp)
+			return
+		}
+
+		writeAPIJSON(w, http.StatusOK, resp)
+	}
 }
 
 // toInternalRideDTO copia os dados da carona sob a trava de leitura, evitando leitura concorrente com reservas.

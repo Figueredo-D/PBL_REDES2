@@ -15,6 +15,11 @@ import (
 	"github.com/Figueredo-D/PBL_REDES/internal/protocol"
 )
 
+// txIDData é o corpo usado pelos endpoints de commit e abort do 2PC.
+type txIDData struct {
+	TransactionID string `json:"transaction_id"`
+}
+
 type Server struct {
 	address        string
 	id             string // Identificador único deste servidor no consórcio
@@ -22,6 +27,7 @@ type Server struct {
 	repo           *domain.RideRepository
 	reqManager     *concurrency.RequestManager // Gestor de Fila de Prioridade com Single Worker
 	clusterManager *cluster.ClusterManager     // Gestor de comunicação inter-nós do consórcio
+	txLog          *domain.TxLog               // Registro das reservas feitas por transação 2PC neste nó
 	mu             sync.Mutex
 	active         bool
 }
@@ -34,6 +40,7 @@ func NewServer(address string, serverID string, peers map[string]string) *Server
 		repo:           domain.NewRideRepository(serverID),
 		reqManager:     concurrency.NewRequestManager(clock),
 		clusterManager: cluster.NewClusterManager(serverID, peers),
+		txLog:          domain.NewTxLog(),
 	}
 }
 
@@ -160,8 +167,8 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 			tempRepo.AddWithID(r)
 		}
 
-		// Consulta os peers pela API REST interna (GET /internal/rides).
-		// Uma falha de peer é registrada e a busca continua com os demais nós.
+		// Consulta os peers via REST (GET /internal/rides). Uma falha de peer é registrada
+		// e a busca segue com os nós que responderem.
 		for peerID := range s.clusterManager.Peers {
 			peerRides, err := s.clusterManager.ListRidesByDateREST(peerID, data.Date)
 			if err != nil {
@@ -206,22 +213,18 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 
 		// --- 2PC: PAPEL DE COORDENADOR ---
 		transactionID := fmt.Sprintf("TX_%d", time.Now().UnixNano())
-		votedPeers := []string{}
-		successPrepare := true
+		votedPeers := []string{}     // peers que responderam VOTE_COMMIT
+		contactedPeers := []string{} // peers que receberam PREPARE, mesmo que a resposta tenha falhado
 
-		// 1. Tenta reservar os segmentos locais pertencentes a este nó
+		// 1. Reserva os trechos locais pelo TxLog. Se um falhar, o próprio TxLog desfaz
+		// as reservas feitas nesta chamada, então não há vagas presas.
+		refs := make([]domain.SegmentRef, 0, len(itin.Segments))
 		for _, seg := range itin.Segments {
-			_, isLocal := s.repo.GetRide(seg.RideID)
-			if isLocal {
-				err := s.repo.TryReserveLocalSegment(seg.RideID, seg.From, seg.To)
-				if err != nil {
-					successPrepare = false
-					break
-				}
-			}
+			refs = append(refs, domain.SegmentRef{RideID: seg.RideID, From: seg.From, To: seg.To})
 		}
+		successPrepare := s.txLog.Prepare(s.repo, transactionID, refs) == nil
 
-		// 2. Se os locais passaram, envia 2PC_PREPARE para todos os peers do consórcio
+		// 2. Se os locais passaram, envia PREPARE via REST para todos os peers do consórcio
 		if successPrepare {
 			var protoSegments []protocol.SegmentInfo
 			for _, sSeg := range itin.Segments {
@@ -236,7 +239,7 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 				})
 			}
 
-			preparePayload, _ := json.Marshal(protocol.TwoPCPrepareData{
+			prepareData := protocol.TwoPCPrepareData{
 				TransactionID: transactionID,
 				Itinerary: protocol.ItineraryOption{
 					ItineraryID:    itin.ItineraryID,
@@ -246,15 +249,12 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 					AvailableSeats: itin.AvailableSeats,
 					Drivers:        itin.Drivers,
 				},
-			})
+			}
 
 			for peerID := range s.clusterManager.Peers {
-				resp, err := s.clusterManager.SendMessage(peerID, protocol.Request{
-					Action: protocol.Action2PCPrepare,
-					Token:  req.Token,
-					Data:   string(preparePayload),
-				})
+				contactedPeers = append(contactedPeers, peerID)
 
+				resp, err := s.clusterManager.PrepareREST(peerID, prepareData)
 				if err != nil || resp.Status != "VOTE_COMMIT" {
 					successPrepare = false
 					break
@@ -265,27 +265,25 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 
 		// Decisão Global (Commit ou Abort)
 		if !successPrepare {
-			for _, seg := range itin.Segments {
-				_, isLocal := s.repo.GetRide(seg.RideID)
-				if isLocal {
-					s.repo.ReleaseLocalSegment(seg.RideID, seg.From, seg.To)
+			// Devolve somente as vagas locais que este prepare reservou
+			s.txLog.Abort(s.repo, transactionID)
+
+			// O ABORT vai para todos os peers contatados, inclusive os que falharam por timeout,
+			// porque um prepare pode ter reservado vagas antes de a resposta se perder.
+			for _, peerID := range contactedPeers {
+				if err := s.clusterManager.AbortREST(peerID, transactionID); err != nil {
+					fmt.Printf("[SERVER %s] Aviso: abort não confirmado em %s: %v\n", s.id, peerID, err)
 				}
-			}
-			for _, peerID := range votedPeers {
-				s.clusterManager.SendMessage(peerID, protocol.Request{
-					Action: protocol.Action2PCAbort,
-					Data:   fmt.Sprintf(`{"transaction_id":"%s"}`, transactionID),
-				})
 			}
 			return protocol.Response{Status: "ERROR", Code: "2PC_ABORTED", Message: "Transação abortada: falha ao garantir vagas."}
 		}
 
 		for _, peerID := range votedPeers {
-			s.clusterManager.SendMessage(peerID, protocol.Request{
-				Action: protocol.Action2PCCommit,
-				Data:   fmt.Sprintf(`{"transaction_id":"%s"}`, transactionID),
-			})
+			if err := s.clusterManager.CommitREST(peerID, transactionID); err != nil {
+				fmt.Printf("[SERVER %s] Aviso: commit não confirmado em %s: %v\n", s.id, peerID, err)
+			}
 		}
+		s.txLog.Commit(transactionID)
 
 		bookingID := s.repo.SaveBooking(req.Token, itin, "CONFIRMED")
 		fmt.Printf("[SERVER %s] Transação 2PC bem-sucedida! Reserva %s confirmada.\n", s.id, bookingID)
@@ -303,28 +301,36 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 			return protocol.Response{Status: "VOTE_ABORT", Message: "Payload de prepare inválido."}
 		}
 
-		canCommit := true
+		refs := make([]domain.SegmentRef, 0, len(data.Itinerary.Segments))
 		for _, seg := range data.Itinerary.Segments {
-			if _, isLocal := s.repo.GetRide(seg.RideID); isLocal {
-				if err := s.repo.TryReserveLocalSegment(seg.RideID, seg.From, seg.To); err != nil {
-					canCommit = false
-					break
-				}
-			}
+			refs = append(refs, domain.SegmentRef{RideID: seg.RideID, From: seg.From, To: seg.To})
 		}
 
-		if !canCommit {
+		// O TxLog reserva apenas os trechos locais e registra o que foi reservado para este abort
+		if err := s.txLog.Prepare(s.repo, data.TransactionID, refs); err != nil {
 			return protocol.Response{Status: "VOTE_ABORT", Message: "Vagas esgotadas neste nó."}
 		}
 
 		return protocol.Response{Status: "VOTE_COMMIT", Message: "Preparado para confirmar."}
 
 	case protocol.Action2PCCommit:
-		fmt.Printf("[SERVER %s] Recebido GLOBAL_COMMIT para a transação.\n", s.id)
+		var data txIDData
+		if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
+			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de commit inválido."}
+		}
+
+		s.txLog.Commit(data.TransactionID)
+		fmt.Printf("[SERVER %s] Recebido GLOBAL_COMMIT da transação %s.\n", s.id, data.TransactionID)
 		return protocol.Response{Status: "SUCCESS", Message: "Commit efetivado."}
 
 	case protocol.Action2PCAbort:
-		fmt.Printf("[SERVER %s] Recebido GLOBAL_ABORT. Revertendo alterações...\n", s.id)
+		var data txIDData
+		if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
+			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de abort inválido."}
+		}
+
+		released := s.txLog.Abort(s.repo, data.TransactionID)
+		fmt.Printf("[SERVER %s] Recebido GLOBAL_ABORT da transação %s. Trechos devolvidos: %d.\n", s.id, data.TransactionID, released)
 		return protocol.Response{Status: "SUCCESS", Message: "Abort efetivado."}
 
 	case protocol.ActionCancelBooking:

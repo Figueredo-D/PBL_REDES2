@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Figueredo-D/PBL_REDES/internal/domain"
+	"github.com/Figueredo-D/PBL_REDES/internal/protocol"
 )
 
 // httpPeerBases mapeia o ID de cada nó para a base da sua API REST interna.
@@ -19,8 +21,8 @@ var httpPeerBases = map[string]string{
 	"SERVER_C": "http://localhost:9082",
 }
 
-// restClient tem timeout curto para que a queda de um nó não trave a busca.
-var restClient = &http.Client{Timeout: 3 * time.Second}
+// restClient tem timeout curto para que a queda de um nó não trave a busca nem o 2PC.
+var restClient = &http.Client{Timeout: 5 * time.Second}
 
 // apiErrorBody é o formato de erro definido no contrato da API interna.
 type apiErrorBody struct {
@@ -59,4 +61,73 @@ func (cm *ClusterManager) ListRidesByDateREST(peerID, date string) ([]*domain.Ri
 	}
 
 	return rides, nil
+}
+
+// postJSON envia um POST com corpo JSON para o peer e devolve o status HTTP e o envelope de resposta.
+func (cm *ClusterManager) postJSON(peerID, path string, payload interface{}) (int, protocol.Response, error) {
+	base, ok := httpPeerBases[peerID]
+	if !ok {
+		return 0, protocol.Response{}, fmt.Errorf("peer %s sem endereço REST configurado", peerID)
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, protocol.Response{}, err
+	}
+
+	resp, err := restClient.Post(base+path, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return 0, protocol.Response{}, fmt.Errorf("falha ao chamar %s em %s: %w", peerID, path, err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, protocol.Response{}, fmt.Errorf("falha ao ler resposta de %s: %w", peerID, err)
+	}
+
+	var out protocol.Response
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return resp.StatusCode, protocol.Response{}, fmt.Errorf("resposta malformada de %s: %w", peerID, err)
+		}
+	}
+
+	return resp.StatusCode, out, nil
+}
+
+// PrepareREST envia POST /internal/prepare ao peer e devolve o seu voto (VOTE_COMMIT ou VOTE_ABORT).
+func (cm *ClusterManager) PrepareREST(peerID string, data protocol.TwoPCPrepareData) (protocol.Response, error) {
+	status, resp, err := cm.postJSON(peerID, "/internal/prepare", data)
+	if err != nil {
+		return protocol.Response{}, err
+	}
+	if status != http.StatusOK && status != http.StatusConflict {
+		return protocol.Response{}, fmt.Errorf("%s respondeu %d no prepare", peerID, status)
+	}
+	return resp, nil
+}
+
+// CommitREST envia POST /internal/commit ao peer para efetivar a transação.
+func (cm *ClusterManager) CommitREST(peerID, transactionID string) error {
+	status, _, err := cm.postJSON(peerID, "/internal/commit", map[string]string{"transaction_id": transactionID})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("%s respondeu %d no commit", peerID, status)
+	}
+	return nil
+}
+
+// AbortREST envia POST /internal/abort ao peer para desfazer a transação e devolver as vagas reservadas.
+func (cm *ClusterManager) AbortREST(peerID, transactionID string) error {
+	status, _, err := cm.postJSON(peerID, "/internal/abort", map[string]string{"transaction_id": transactionID})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("%s respondeu %d no abort", peerID, status)
+	}
+	return nil
 }
