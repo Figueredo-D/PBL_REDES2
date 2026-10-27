@@ -3,20 +3,20 @@ package domain
 // SearchFilter representa os parâmetros informados pelo passageiro na busca de itinerários.
 type SearchFilter struct {
 	Origin      string `json:"origin"`
-	Destination string `json:"destination"` 
+	Destination string `json:"destination"`
 	Date        string `json:"date"`
 }
 
 // ItinerarySegmentDetail descreve detalhadamente um trecho do itinerário gerado na busca.
 type ItinerarySegmentDetail struct {
-	RideID         string  `json:"ride_id"`        // ID da carona correspondente
-	CompanyID      string  `json:"company_id"`     // Empresa responsável por este trecho (utilizado no 2PC)
-	DriverToken    string  `json:"driver_token"`   // Token do motorista deste trecho
-	From           string  `json:"from"`           // Origem do trecho
-	To             string  `json:"to"`             // Destino do trecho
-	DepartureTime  string  `json:"departure_time"` // Horário de partida do trecho
-	Price          float64 `json:"price"`          // Valor deste trecho
-	AvailableSeats int     `json:"available_seats"`// Vagas restantes neste trecho
+	RideID         string  `json:"ride_id"`         // ID da carona correspondente
+	CompanyID      string  `json:"company_id"`      // Empresa responsável por este trecho (utilizado no 2PC)
+	DriverToken    string  `json:"driver_token"`    // Token do motorista deste trecho
+	From           string  `json:"from"`            // Origem do trecho
+	To             string  `json:"to"`              // Destino do trecho
+	DepartureTime  string  `json:"departure_time"`  // Horário de partida do trecho
+	Price          float64 `json:"price"`           // Valor deste trecho
+	AvailableSeats int     `json:"available_seats"` // Vagas restantes neste trecho
 }
 
 // ItineraryResult representa uma rota completa (direta ou combinada) encontrada pelo algoritmo de busca.
@@ -103,7 +103,7 @@ func FindItineraries(rides []*Ride, filter SearchFilter) []ItineraryResult {
 				continue
 			}
 
-			// Validação temporal das conexões: 
+			// Validação temporal das conexões:
 			// A segunda carona não pode partir antes da primeira carona
 			if len(current.Edges) > 0 {
 				lastEdge := current.Edges[len(current.Edges)-1]
