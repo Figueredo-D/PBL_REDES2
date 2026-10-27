@@ -179,6 +179,8 @@ func (s *Server) handleSearch(req protocol.Request) protocol.Response {
 
 // handleBook executa o papel de coordenador do 2PC. Somente as operações sobre o estado local
 // entram no worker. Cada chamada REST é feita diretamente pela goroutine da conexão.
+// handleBook executa o papel de coordenador do 2PC. Gera o timestamp de Lamport da transação e o envia
+// em todos os prepares. Somente as operações locais entram no worker; as chamadas REST saem dele.
 func (s *Server) handleBook(req protocol.Request) protocol.Response {
 	var itin domain.ItineraryResult
 	if err := json.Unmarshal([]byte(req.Data), &itin); err != nil {
@@ -190,6 +192,8 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 		return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Itinerário sem trechos."}
 	}
 
+	// Timestamp de Lamport desta transação. Define a precedência em todos os nós envolvidos.
+	lamportTS := s.reqManager.NextTimestamp()
 	transactionID := fmt.Sprintf("TX_%d", time.Now().UnixNano())
 
 	refs := make([]domain.SegmentRef, 0, len(itin.Segments))
@@ -197,9 +201,9 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 		refs = append(refs, domain.SegmentRef{RideID: seg.RideID, From: seg.From, To: seg.To})
 	}
 
-	// 1. Fase 1 local: reserva os trechos locais pelo TxLog, dentro do worker
+	// 1. Fase 1 local: reserva os trechos locais pelo TxLog, dentro do worker, na ordem da transação
 	var localErr error
-	if err := s.reqManager.Submit(func() error {
+	if err := s.reqManager.SubmitAt(lamportTS, s.id, func() error {
 		localErr = s.txLog.Prepare(s.repo, transactionID, refs)
 		return nil
 	}); err != nil {
@@ -216,6 +220,7 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 		for _, sSeg := range itin.Segments {
 			protoSegments = append(protoSegments, protocol.SegmentInfo{
 				RideID:         sSeg.RideID,
+				CompanyID:      sSeg.CompanyID,
 				DriverToken:    sSeg.DriverToken,
 				From:           sSeg.From,
 				To:             sSeg.To,
@@ -227,6 +232,8 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 
 		prepareData := protocol.TwoPCPrepareData{
 			TransactionID: transactionID,
+			LamportTime:   lamportTS,
+			CoordinatorID: s.id,
 			Itinerary: protocol.ItineraryOption{
 				ItineraryID:    itin.ItineraryID,
 				Segments:       protoSegments,
@@ -249,7 +256,7 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 		}
 	}
 
-	// 3. Decisão global
+	// 3. Decisão global: ABORT
 	if !successPrepare {
 		// Devolve somente as vagas locais que este prepare reservou
 		if err := s.reqManager.Submit(func() error {
@@ -259,8 +266,7 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 			fmt.Printf("[SERVER %s] Aviso: abort local falhou na transação %s: %v\n", s.id, transactionID, err)
 		}
 
-		// O ABORT vai para todos os peers
-
+		// O ABORT vai para todos os peers contatados, inclusive os que falharam por timeout
 		for _, peerID := range contactedPeers {
 			if err := s.clusterManager.AbortREST(peerID, transactionID); err != nil {
 				fmt.Printf("[SERVER %s] Aviso: abort não confirmado em %s: %v\n", s.id, peerID, err)
@@ -269,7 +275,7 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 		return protocol.Response{Status: "ERROR", Code: "2PC_ABORTED", Message: "Transação abortada: falha ao garantir vagas."}
 	}
 
-	// 4. Decisão COMMIT: envia commit aos peers que votaram
+	// 4. Decisão global: COMMIT nos peers que votaram
 	for _, peerID := range votedPeers {
 		if err := s.clusterManager.CommitREST(peerID, transactionID); err != nil {
 			fmt.Printf("[SERVER %s] Aviso: commit não confirmado em %s: %v\n", s.id, peerID, err)

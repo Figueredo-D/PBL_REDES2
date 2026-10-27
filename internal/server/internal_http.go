@@ -109,10 +109,22 @@ func (s *Server) handleInternal2PC(action string) http.HandlerFunc {
 		}
 
 		var resp protocol.Response
-		err = s.reqManager.Submit(func() error {
+		task := func() error {
 			resp = s.dispatch(protocol.Request{Action: action, Data: string(body)})
 			return nil
-		})
+		}
+
+		if action == protocol.Action2PCPrepare {
+			var data protocol.TwoPCPrepareData
+			if jerr := json.Unmarshal(body, &data); jerr != nil {
+				writeAPIError(w, http.StatusBadRequest, "INVALID_DATA", "corpo do prepare inválido")
+				return
+			}
+			err = s.reqManager.SubmitAt(data.LamportTime, data.CoordinatorID, task)
+		} else {
+			err = s.reqManager.Submit(task)
+		}
+
 		if err != nil {
 			writeAPIError(w, http.StatusInternalServerError, "WORKER_EXECUTION_FAILED", err.Error())
 			return
