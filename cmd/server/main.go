@@ -22,14 +22,21 @@ func main() {
 
 	serverID := os.Args[1]
 
-	// Mapeamento fixo de portas para cada nó do consórcio
+	// Porta TCP usada pelos clientes (motorista e passageiro)
 	ports := map[string]string{
 		"SERVER_A": ":8080",
 		"SERVER_B": ":8081",
 		"SERVER_C": ":8082",
 	}
 
-	// Mapeamento fixo dos vizinhos (peers) para cada nó
+	// Porta da API REST interna, usada pelos outros servidores do consórcio
+	internalPorts := map[string]string{
+		"SERVER_A": ":9080",
+		"SERVER_B": ":9081",
+		"SERVER_C": ":9082",
+	}
+
+	// Mapeamento fixo dos vizinhos (peers) para cada nó (TCP, ainda usado no 2PC nesta etapa)
 	allPeers := map[string]map[string]string{
 		"SERVER_A": {
 			"SERVER_B": "localhost:8081",
@@ -46,14 +53,19 @@ func main() {
 	}
 
 	port, portExists := ports[serverID]
+	internalPort, internalExists := internalPorts[serverID]
 	peers, peersExist := allPeers[serverID]
 
-	if !portExists || !peersExist {
+	if !portExists || !internalExists || !peersExist {
 		log.Fatalf("[FATAL] ID de servidor inválido: '%s'. Utilize SERVER_A, SERVER_B ou SERVER_C.", serverID)
 	}
 
-	// Inicializa o servidor com a porta fixa, o ID e o mapa de peers configurados
 	srv := server.NewServer(port, serverID, peers)
+
+	// Sobe a API REST interna antes do listener TCP, que bloqueia a execução
+	if err := srv.StartInternalHTTP(internalPort); err != nil {
+		log.Fatalf("[FATAL] %v", err)
+	}
 
 	if err := srv.Start(); err != nil {
 		log.Fatalf("[FATAL] Erro ao rodar o servidor %s: %v", serverID, err)
