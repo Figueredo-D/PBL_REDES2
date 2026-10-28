@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -27,20 +28,48 @@ type Server struct {
 	repo           *domain.RideRepository
 	reqManager     *concurrency.RequestManager // Gestor de Fila de Prioridade com Single Worker
 	clusterManager *cluster.ClusterManager     // Gestor de comunicação inter-nós do consórcio
-	txLog          *domain.TxLog               // Registro das reservas feitas por transação 2PC neste nó
+	txLog          *domain.TxLog               // Registro das transações 2PC deste nó (pendentes, decisões e coordenadores)
+	dataPath       string                      // Arquivo JSON deste nó (ex: data/SERVER_A/estado.json)
 	mu             sync.Mutex
 	active         bool
 }
 
-func NewServer(address string, serverID string, peers map[string]string) *Server {
+// NewServer carrega o estado salvo deste nó (ou começa vazio na primeira execução) e monta o servidor.
+// O registro de transações fica no mesmo diretório do estado, em txlog.json.
+func NewServer(address string, serverID string, peers map[string]string, dataPath string) (*Server, error) {
+	repo, err := domain.LoadRideRepository(serverID, dataPath)
+	if err != nil {
+		return nil, err
+	}
+
+	txLog, err := domain.LoadTxLog(filepath.Join(filepath.Dir(dataPath), "txlog.json"))
+	if err != nil {
+		return nil, err
+	}
+
 	clock := concurrency.NewLogicalClock(serverID)
 	return &Server{
 		address:        address,
 		id:             serverID,
-		repo:           domain.NewRideRepository(serverID),
+		repo:           repo,
+		dataPath:       dataPath,
 		reqManager:     concurrency.NewRequestManager(clock),
 		clusterManager: cluster.NewClusterManager(serverID, peers),
-		txLog:          domain.NewTxLog(),
+		txLog:          txLog,
+	}, nil
+}
+
+// saveState grava o estado atual do nó em disco. Deve ser chamada dentro do Single Worker, logo após uma mudança.
+func (s *Server) saveState() {
+	if err := s.repo.SaveToFile(s.dataPath); err != nil {
+		fmt.Printf("[SERVER %s] Aviso: falha ao salvar estado: %v\n", s.id, err)
+	}
+}
+
+// recordDecision grava a decisão global da transação antes de ela ser enviada aos participantes.
+func (s *Server) recordDecision(txID, decision string) {
+	if err := s.txLog.RecordDecision(txID, decision); err != nil {
+		fmt.Printf("[SERVER %s] Aviso: falha ao gravar decisão %s da transação %s: %v\n", s.id, decision, txID, err)
 	}
 }
 
@@ -177,10 +206,9 @@ func (s *Server) handleSearch(req protocol.Request) protocol.Response {
 	}
 }
 
-// handleBook executa o papel de coordenador do 2PC. Somente as operações sobre o estado local
-// entram no worker. Cada chamada REST é feita diretamente pela goroutine da conexão.
 // handleBook executa o papel de coordenador do 2PC. Gera o timestamp de Lamport da transação e o envia
 // em todos os prepares. Somente as operações locais entram no worker; as chamadas REST saem dele.
+// A decisão global é gravada no TxLog antes de qualquer COMMIT ou ABORT ser enviado.
 func (s *Server) handleBook(req protocol.Request) protocol.Response {
 	var itin domain.ItineraryResult
 	if err := json.Unmarshal([]byte(req.Data), &itin); err != nil {
@@ -196,6 +224,10 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 	lamportTS := s.reqManager.NextTimestamp()
 	transactionID := fmt.Sprintf("TX_%d", time.Now().UnixNano())
 
+	// Marca a transação como em andamento antes de qualquer reserva.
+	// Se o coordenador cair sem decisão gravada, a recuperação sabe que ela não foi decidida.
+	s.txLog.BeginCoordination(transactionID)
+
 	refs := make([]domain.SegmentRef, 0, len(itin.Segments))
 	for _, seg := range itin.Segments {
 		refs = append(refs, domain.SegmentRef{RideID: seg.RideID, From: seg.From, To: seg.To})
@@ -204,7 +236,10 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 	// 1. Fase 1 local: reserva os trechos locais pelo TxLog, dentro do worker, na ordem da transação
 	var localErr error
 	if err := s.reqManager.SubmitAt(lamportTS, s.id, func() error {
-		localErr = s.txLog.Prepare(s.repo, transactionID, refs)
+		localErr = s.txLog.PrepareWithCoordinator(s.repo, transactionID, s.id, refs)
+		if localErr == nil {
+			s.saveState()
+		}
 		return nil
 	}); err != nil {
 		localErr = err
@@ -258,9 +293,13 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 
 	// 3. Decisão global: ABORT
 	if !successPrepare {
+		// Grava a decisão antes de avisar qualquer participante
+		s.recordDecision(transactionID, domain.DecisionAbort)
+
 		// Devolve somente as vagas locais que este prepare reservou
 		if err := s.reqManager.Submit(func() error {
 			s.txLog.Abort(s.repo, transactionID)
+			s.saveState()
 			return nil
 		}); err != nil {
 			fmt.Printf("[SERVER %s] Aviso: abort local falhou na transação %s: %v\n", s.id, transactionID, err)
@@ -275,7 +314,9 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 		return protocol.Response{Status: "ERROR", Code: "2PC_ABORTED", Message: "Transação abortada: falha ao garantir vagas."}
 	}
 
-	// 4. Decisão global: COMMIT nos peers que votaram
+	// 4. Decisão global: COMMIT. Grava antes de enviar aos peers que votaram.
+	s.recordDecision(transactionID, domain.DecisionCommit)
+
 	for _, peerID := range votedPeers {
 		if err := s.clusterManager.CommitREST(peerID, transactionID); err != nil {
 			fmt.Printf("[SERVER %s] Aviso: commit não confirmado em %s: %v\n", s.id, peerID, err)
@@ -287,6 +328,7 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 	if err := s.reqManager.Submit(func() error {
 		s.txLog.Commit(transactionID)
 		bookingID = s.repo.SaveBooking(req.Token, itin, "CONFIRMED")
+		s.saveState()
 		return nil
 	}); err != nil {
 		return protocol.Response{Status: "ERROR", Code: "WORKER_EXECUTION_FAILED", Message: err.Error()}
@@ -317,6 +359,7 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		}
 
 		rideID := s.repo.Add(ride)
+		s.saveState()
 		fmt.Printf("[SERVER %s] Carona %s ofertada por %s.\n", s.id, rideID, req.Token)
 
 		return protocol.Response{
@@ -340,6 +383,7 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 			return protocol.Response{Status: "ERROR", Code: "CANCEL_FAILED", Message: err.Error()}
 		}
 
+		s.saveState()
 		fmt.Printf("[SERVER %s] Carona %s cancelada por %s.\n", s.id, data.RideID, req.Token)
 		return protocol.Response{Status: "SUCCESS", Message: "Carona cancelada com sucesso."}
 
@@ -366,9 +410,10 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		}
 
 		// O TxLog reserva apenas os trechos locais e registra o que foi reservado para este abort
-		if err := s.txLog.Prepare(s.repo, data.TransactionID, refs); err != nil {
+		if err := s.txLog.PrepareWithCoordinator(s.repo, data.TransactionID, data.CoordinatorID, refs); err != nil {
 			return protocol.Response{Status: "VOTE_ABORT", Message: "Vagas esgotadas neste nó."}
 		}
+		s.saveState()
 
 		return protocol.Response{Status: "VOTE_COMMIT", Message: "Preparado para confirmar."}
 
@@ -379,6 +424,7 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		}
 
 		s.txLog.Commit(data.TransactionID)
+		s.saveState()
 		fmt.Printf("[SERVER %s] Recebido GLOBAL_COMMIT da transação %s.\n", s.id, data.TransactionID)
 		return protocol.Response{Status: "SUCCESS", Message: "Commit efetivado."}
 
@@ -389,6 +435,7 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		}
 
 		released := s.txLog.Abort(s.repo, data.TransactionID)
+		s.saveState()
 		fmt.Printf("[SERVER %s] Recebido GLOBAL_ABORT da transação %s. Trechos devolvidos: %d.\n", s.id, data.TransactionID, released)
 		return protocol.Response{Status: "SUCCESS", Message: "Abort efetivado."}
 

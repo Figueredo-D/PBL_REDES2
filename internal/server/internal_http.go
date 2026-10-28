@@ -39,6 +39,14 @@ type internalRideDTO struct {
 	Segments    []internalSegmentDTO `json:"segments"`
 }
 
+// internalDecisionDTO é a resposta de GET /internal/transactions/decision.
+// Decision pode ser COMMIT, ABORT, IN_PROGRESS ou UNKNOWN (este nó nunca registrou a transação).
+type internalDecisionDTO struct {
+	TransactionID string `json:"transaction_id"`
+	Decision      string `json:"decision"`
+	CoordinatorID string `json:"coordinator_id"`
+}
+
 // StartInternalHTTP sobe a API REST interna do nó em um endereço separado do TCP dos clientes.
 // Deve ser chamada antes de Start(), que bloqueia a execução.
 func (s *Server) StartInternalHTTP(addr string) error {
@@ -47,6 +55,7 @@ func (s *Server) StartInternalHTTP(addr string) error {
 	mux.HandleFunc("/internal/prepare", s.handleInternal2PC(protocol.Action2PCPrepare))
 	mux.HandleFunc("/internal/commit", s.handleInternal2PC(protocol.Action2PCCommit))
 	mux.HandleFunc("/internal/abort", s.handleInternal2PC(protocol.Action2PCAbort))
+	mux.HandleFunc("/internal/transactions/decision", s.handleInternalDecision)
 
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -146,6 +155,32 @@ func (s *Server) handleInternal2PC(action string) http.HandlerFunc {
 
 		writeAPIJSON(w, http.StatusOK, resp)
 	}
+}
+
+// handleInternalDecision implementa GET /internal/transactions/decision?transaction_id=TX_...
+// Informa a decisão que este nó conhece para a transação. Como só lê o registro, não passa pelo worker.
+func (s *Server) handleInternalDecision(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "use o método GET")
+		return
+	}
+
+	txID := r.URL.Query().Get("transaction_id")
+	if txID == "" {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_DATA", "parâmetro 'transaction_id' é obrigatório")
+		return
+	}
+
+	decision := s.txLog.DecisionFor(txID)
+	if decision == "" {
+		decision = "UNKNOWN"
+	}
+
+	writeAPIJSON(w, http.StatusOK, internalDecisionDTO{
+		TransactionID: txID,
+		Decision:      decision,
+		CoordinatorID: s.id,
+	})
 }
 
 // toInternalRideDTO copia os dados da carona sob a trava de leitura, evitando leitura concorrente com reservas.

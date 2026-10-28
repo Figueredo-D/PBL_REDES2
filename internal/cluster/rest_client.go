@@ -30,6 +30,13 @@ type apiErrorBody struct {
 	Message string `json:"message"`
 }
 
+// internalDecisionResponse é a resposta de GET /internal/transactions/decision.
+type internalDecisionResponse struct {
+	TransactionID string `json:"transaction_id"`
+	Decision      string `json:"decision"`
+	CoordinatorID string `json:"coordinator_id"`
+}
+
 // ListRidesByDateREST consulta GET /internal/rides no peer informado e devolve as caronas da data.
 func (cm *ClusterManager) ListRidesByDateREST(peerID, date string) ([]*domain.Ride, error) {
 	base, ok := httpPeerBases[peerID]
@@ -130,4 +137,42 @@ func (cm *ClusterManager) AbortREST(peerID, transactionID string) error {
 		return fmt.Errorf("%s respondeu %d no abort", peerID, status)
 	}
 	return nil
+}
+
+// DecisionREST pergunta ao coordenador o desfecho de uma transação via GET /internal/transactions/decision.
+// Devolve COMMIT, ABORT, IN_PROGRESS ou UNKNOWN. Se o coordenador não responder, devolve erro,
+// e o participante deve manter a transação pendente e tentar de novo mais tarde.
+func (cm *ClusterManager) DecisionREST(coordinatorID, transactionID string) (string, error) {
+	base, ok := httpPeerBases[coordinatorID]
+	if !ok {
+		return "", fmt.Errorf("coordenador %s sem endereço REST configurado", coordinatorID)
+	}
+
+	endpoint := base + "/internal/transactions/decision?transaction_id=" + url.QueryEscape(transactionID)
+	resp, err := restClient.Get(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("falha ao consultar decisão em %s: %w", coordinatorID, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("falha ao ler decisão de %s: %w", coordinatorID, err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		var apiErr apiErrorBody
+		json.Unmarshal(body, &apiErr)
+		return "", fmt.Errorf("%s respondeu %d na decisão (%s): %s", coordinatorID, resp.StatusCode, apiErr.Code, apiErr.Message)
+	}
+
+	var out internalDecisionResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", fmt.Errorf("resposta de decisão malformada de %s: %w", coordinatorID, err)
+	}
+	if out.Decision == "" {
+		return "", fmt.Errorf("%s não informou a decisão da transação %s", coordinatorID, transactionID)
+	}
+
+	return out.Decision, nil
 }
