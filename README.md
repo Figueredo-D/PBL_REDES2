@@ -30,9 +30,9 @@ Sistema distribuído de reservas de caronas onde **três empresas independentes*
                     CONSÓRCIO VAIJUNTO
   ┌─────────────────────────────────────────────────────────┐
   │                                                         │
-  │  [Motorista A] ──TCP──► [SERVER_A :8080] ◄──── REST    │
-  │  [Passageiro A]──TCP──►  API Interna:9080  ────────────►│──► [SERVER_B :9081]
-  │                                             ◄───────────│──► [SERVER_C :9082]
+  │  [Motorista A] ──TCP──► [SERVER_A :8080]                │
+  │  [Passageiro A]──TCP──►  API Interna:9080               │
+  │                                                         │
   │                                                         │
   │  [Motorista B] ──TCP──► [SERVER_B :8081]                │
   │  [Passageiro B]──TCP──►  API Interna:9081               │
@@ -180,9 +180,7 @@ docker compose start server_b
 
 ---
 
-## Opção C — Rodando em Máquinas Distintas do Laboratório
-
-Cenário real do laboratório (LARSID/LADICA): cada servidor em um computador diferente.
+## Opção C — Rodando em Máquinas Distintas
 
 ### Pré-requisito: descobrir os IPs das máquinas
 
@@ -220,7 +218,7 @@ go run cmd/server/main.go -id SERVER_C -port 8082 -internal-port 9082 \
   -peers "SERVER_A=http://192.168.1.10:9080,SERVER_B=http://192.168.1.11:9081"
 ```
 
-### Opção C.2 — Docker em cada máquina (recomendado para a apresentação)
+### Opção C.2 — Docker em cada máquina
 
 Em cada máquina, copie o repositório e crie um arquivo `.env` no diretório do projeto. Depois rode apenas o container daquela empresa:
 
