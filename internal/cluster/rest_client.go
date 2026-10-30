@@ -58,7 +58,7 @@ func (cm *ClusterManager) ListRidesByDateREST(peerID, date string) ([]*domain.Ri
 
 	if resp.StatusCode != http.StatusOK {
 		var apiErr apiErrorBody
-		json.Unmarshal(body, &apiErr)
+		_ = json.Unmarshal(body, &apiErr)
 		return nil, fmt.Errorf("%s respondeu %d (%s): %s", peerID, resp.StatusCode, apiErr.Code, apiErr.Message)
 	}
 
@@ -103,7 +103,7 @@ func (cm *ClusterManager) postJSON(peerID, path string, payload interface{}) (in
 	return resp.StatusCode, out, nil
 }
 
-// PrepareREST envia POST /internal/prepare ao peer e devolve o seu voto (VOTE_COMMIT ou VOTE_ABORT).
+// PrepareREST envia POST /internal/prepare ao peer e devolve seu voto.
 func (cm *ClusterManager) PrepareREST(peerID string, data protocol.TwoPCPrepareData) (protocol.Response, error) {
 	status, resp, err := cm.postJSON(peerID, "/internal/prepare", data)
 	if err != nil {
@@ -117,7 +117,9 @@ func (cm *ClusterManager) PrepareREST(peerID string, data protocol.TwoPCPrepareD
 
 // CommitREST envia POST /internal/commit ao peer para efetivar a transação.
 func (cm *ClusterManager) CommitREST(peerID, transactionID string) error {
-	status, _, err := cm.postJSON(peerID, "/internal/commit", map[string]string{"transaction_id": transactionID})
+	status, _, err := cm.postJSON(peerID, "/internal/commit", map[string]string{
+		"transaction_id": transactionID,
+	})
 	if err != nil {
 		return err
 	}
@@ -129,7 +131,9 @@ func (cm *ClusterManager) CommitREST(peerID, transactionID string) error {
 
 // AbortREST envia POST /internal/abort ao peer para desfazer a transação e devolver as vagas reservadas.
 func (cm *ClusterManager) AbortREST(peerID, transactionID string) error {
-	status, _, err := cm.postJSON(peerID, "/internal/abort", map[string]string{"transaction_id": transactionID})
+	status, _, err := cm.postJSON(peerID, "/internal/abort", map[string]string{
+		"transaction_id": transactionID,
+	})
 	if err != nil {
 		return err
 	}
@@ -139,9 +143,22 @@ func (cm *ClusterManager) AbortREST(peerID, transactionID string) error {
 	return nil
 }
 
+// ReleaseREST envia POST /internal/release ao peer para devolver as vagas locais
+// de uma reserva cancelada. A operação deve ser idempotente por BookingID.
+func (cm *ClusterManager) ReleaseREST(peerID string, data protocol.ReleaseSeatsData) error {
+	status, resp, err := cm.postJSON(peerID, "/internal/release", data)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("%s respondeu %d ao devolver vagas: %s", peerID, status, resp.Message)
+	}
+	return nil
+}
+
 // DecisionREST pergunta ao coordenador o desfecho de uma transação via GET /internal/transactions/decision.
 // Devolve COMMIT, ABORT, IN_PROGRESS ou UNKNOWN. Se o coordenador não responder, devolve erro,
-// e o participante deve manter a transação pendente e tentar de novo mais tarde.
+// e o participante deve manter a transação pendente e tentar novamente mais tarde.
 func (cm *ClusterManager) DecisionREST(coordinatorID, transactionID string) (string, error) {
 	base, ok := httpPeerBases[coordinatorID]
 	if !ok {
@@ -162,7 +179,7 @@ func (cm *ClusterManager) DecisionREST(coordinatorID, transactionID string) (str
 
 	if resp.StatusCode != http.StatusOK {
 		var apiErr apiErrorBody
-		json.Unmarshal(body, &apiErr)
+		_ = json.Unmarshal(body, &apiErr)
 		return "", fmt.Errorf("%s respondeu %d na decisão (%s): %s", coordinatorID, resp.StatusCode, apiErr.Code, apiErr.Message)
 	}
 

@@ -7,12 +7,14 @@ import (
 )
 
 // Booking representa o registro de uma reserva feita por um passageiro no servidor.
+// PendingReleases lista as empresas que ainda precisam devolver as vagas de uma reserva cancelada.
 type Booking struct {
-	ID             string          `json:"id"`
-	PassengerToken string          `json:"passenger_token"`
-	Itinerary      ItineraryResult `json:"itinerary"`
-	Date           string          `json:"date"`
-	Status         string          `json:"status"`
+	ID              string          `json:"id"`
+	PassengerToken  string          `json:"passenger_token"`
+	Itinerary       ItineraryResult `json:"itinerary"`
+	Date            string          `json:"date"`
+	Status          string          `json:"status"`
+	PendingReleases []string        `json:"pending_releases,omitempty"`
 }
 
 // RideRepository é o repositório em memória do servidor local.
@@ -21,6 +23,7 @@ type RideRepository struct {
 	nodeID       string
 	rides        map[string]*Ride
 	bookings     map[string]*Booking
+	released     map[string]bool // IDs de reservas cujas vagas locais já foram devolvidas (idempotência)
 	rideCount    int
 	bookingCount int
 }
@@ -31,6 +34,7 @@ func NewRideRepository(nodeID string) *RideRepository {
 		nodeID:   nodeID,
 		rides:    make(map[string]*Ride),
 		bookings: make(map[string]*Booking),
+		released: make(map[string]bool),
 	}
 }
 
@@ -211,4 +215,100 @@ func (r *RideRepository) ListBookingsByPassenger(passengerToken string) []*Booki
 		}
 	}
 	return result
+}
+
+// BeginCancelBooking marca a reserva do passageiro como CANCELLED e registra quais empresas ainda
+// precisam devolver as vagas. Só reservas CONFIRMED podem ser canceladas, e só pelo dono.
+// Devolve uma cópia da reserva para o chamador avisar os outros nós sem segurar a trava.
+func (r *RideRepository) BeginCancelBooking(bookingID, passengerToken string) (Booking, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	b, exists := r.bookings[bookingID]
+	if !exists || b.PassengerToken != passengerToken {
+		return Booking{}, fmt.Errorf("reserva não encontrada")
+	}
+
+	switch b.Status {
+	case "CONFIRMED":
+		// segue o cancelamento
+	case "CANCELLED":
+		return Booking{}, fmt.Errorf("a reserva já foi cancelada")
+	case "CANCELLED_BY_DRIVER":
+		return Booking{}, fmt.Errorf("a reserva já foi cancelada pelo motorista")
+	default:
+		return Booking{}, fmt.Errorf("a reserva não pode ser cancelada no status %s", b.Status)
+	}
+
+	seen := make(map[string]bool)
+	var companies []string
+	for _, seg := range b.Itinerary.Segments {
+		if !seen[seg.CompanyID] {
+			seen[seg.CompanyID] = true
+			companies = append(companies, seg.CompanyID)
+		}
+	}
+
+	b.Status = "CANCELLED"
+	b.PendingReleases = companies
+	return *b, nil
+}
+
+// CompleteRelease registra que a empresa informada já devolveu as vagas da reserva cancelada.
+func (r *RideRepository) CompleteRelease(bookingID, companyID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	b, exists := r.bookings[bookingID]
+	if !exists {
+		return
+	}
+
+	var restantes []string
+	for _, c := range b.PendingReleases {
+		if c != companyID {
+			restantes = append(restantes, c)
+		}
+	}
+	b.PendingReleases = restantes
+}
+
+// BookingsWithPendingReleases devolve cópias das reservas canceladas que ainda aguardam devolução de vagas
+// em alguma empresa. Usado pela recuperação para tentar de novo.
+func (r *RideRepository) BookingsWithPendingReleases() []Booking {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var result []Booking
+	for _, b := range r.bookings {
+		if len(b.PendingReleases) > 0 {
+			result = append(result, *b)
+		}
+	}
+	return result
+}
+
+// ApplyRelease devolve as vagas locais dos trechos informados, uma única vez por reserva.
+// Chamadas repetidas com o mesmo bookingID não devolvem de novo. Trechos de caronas que não
+// existem neste nó (de outras empresas ou já canceladas pelo motorista) são ignorados.
+// Retorna a quantidade de trechos devolvidos.
+func (r *RideRepository) ApplyRelease(bookingID string, segs []SegmentRef) int {
+	r.mu.Lock()
+	if r.released[bookingID] {
+		r.mu.Unlock()
+		return 0
+	}
+	r.released[bookingID] = true
+	r.mu.Unlock()
+
+	n := 0
+	for _, s := range segs {
+		if _, isLocal := r.GetRide(s.RideID); !isLocal {
+			continue
+		}
+		if err := r.ReleaseLocalSegment(s.RideID, s.From, s.To); err == nil {
+			n++
+		}
+	}
+	return n
 }

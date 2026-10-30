@@ -15,6 +15,7 @@ type estadoPersistido struct {
 	BookingCount int                 `json:"booking_count"`
 	Rides        map[string]*Ride    `json:"rides"`
 	Bookings     map[string]*Booking `json:"bookings"`
+	Released     map[string]bool     `json:"released"` // reservas canceladas cujas vagas locais já foram devolvidas
 }
 
 // copiaRide faz uma cópia independente da carona, lida sob a trava de leitura dela.
@@ -55,6 +56,7 @@ func (r *RideRepository) SaveToFile(path string) error {
 		BookingCount: r.bookingCount,
 		Rides:        copias,
 		Bookings:     r.bookings,
+		Released:     r.released,
 	}
 	dados, err := json.MarshalIndent(estado, "", "  ")
 	r.mu.RUnlock()
@@ -81,6 +83,7 @@ func (r *RideRepository) SaveToFile(path string) error {
 
 // LoadRideRepository cria o repositório do nó a partir do arquivo em path.
 // Se o arquivo não existir (primeira execução), devolve um repositório vazio.
+// Arquivos gravados por versões anteriores, sem o campo released, também são aceitos.
 func LoadRideRepository(nodeID, path string) (*RideRepository, error) {
 	repo := NewRideRepository(nodeID)
 
@@ -108,6 +111,9 @@ func LoadRideRepository(nodeID, path string) (*RideRepository, error) {
 	}
 	if estado.Bookings != nil {
 		repo.bookings = estado.Bookings
+	}
+	if estado.Released != nil {
+		repo.released = estado.Released
 	}
 
 	return repo, nil

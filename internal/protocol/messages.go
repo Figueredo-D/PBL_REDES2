@@ -14,6 +14,10 @@ const (
 	Action2PCPrepare = "2PC_PREPARE"
 	Action2PCCommit  = "2PC_COMMIT"
 	Action2PCAbort   = "2PC_ABORT"
+
+	// Ação entre nós para devolver as vagas de uma reserva cancelada pelo passageiro.
+	// Não usa 2PC: devolver uma vaga não conflita com outras operações e é idempotente por reserva.
+	ActionReleaseSeats = "RELEASE_SEATS"
 )
 
 type Request struct {
@@ -56,6 +60,13 @@ type CancelBookingData struct {
 	BookingID string `json:"booking_id"`
 }
 
+// ReleaseSeatsData é o payload de POST /internal/release. O nó que guarda a reserva cancelada envia
+// o ID dela e os trechos; cada empresa devolve apenas os trechos das suas caronas, uma vez por reserva.
+type ReleaseSeatsData struct {
+	BookingID string        `json:"booking_id"`
+	Segments  []SegmentInfo `json:"segments"`
+}
+
 // Payload da Fase 1 do 2PC (Prepare). LamportTime e CoordinatorID definem a precedência
 // da transação na fila de cada participante: menor timestamp primeiro, desempate pelo ID do coordenador.
 type TwoPCPrepareData struct {
@@ -90,5 +101,5 @@ type Booking struct {
 	PassengerToken string          `json:"passenger_token"`
 	Itinerary      ItineraryOption `json:"itinerary"`
 	Date           string          `json:"date"`
-	Status         string          `json:"status"` // "CONFIRMED", "CANCELLED"
+	Status         string          `json:"status"` // "CONFIRMED", "CANCELLED", "CANCELLED_BY_DRIVER"
 }

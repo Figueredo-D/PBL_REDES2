@@ -8,39 +8,47 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Figueredo-D/PBL_REDES/internal/domain"
 	"github.com/Figueredo-D/PBL_REDES/internal/protocol"
 )
 
 type Client struct {
-	conn   net.Conn
-	reader *bufio.Reader
+	address string
+	conn    net.Conn
+	reader  *bufio.Reader
 }
 
 func NewClient(address string) (*Client, error) {
-	conn, err := net.Dial("tcp", address)
-	if err != nil {
+	c := &Client{address: address}
+	if err := c.connect(); err != nil {
 		return nil, err
 	}
-	return &Client{
-		conn:   conn,
-		reader: bufio.NewReader(conn),
-	}, nil
+	return c, nil
 }
 
-func (c *Client) Send(action, token string, payload interface{}) (*protocol.Response, error) {
-	var payloadString string
-	if payload != nil {
-		bytes, _ := json.Marshal(payload)
-		payloadString = string(bytes)
+// connect abre uma nova conexão TCP com o nó escolhido, fechando a anterior se existir.
+func (c *Client) connect() error {
+	if c.conn != nil {
+		c.conn.Close()
 	}
+	conn, err := net.DialTimeout("tcp", c.address, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	c.conn = conn
+	c.reader = bufio.NewReader(conn)
+	return nil
+}
 
-	req := protocol.Request{Action: action, Token: token, Data: payloadString}
-	reqBytes, _ := json.Marshal(req)
-	reqBytes = append(reqBytes, '\n')
+// roundTrip envia a requisição e lê a resposta na conexão atual.
+func (c *Client) roundTrip(reqBytes []byte) (*protocol.Response, error) {
+	c.conn.SetDeadline(time.Now().Add(15 * time.Second))
 
-	c.conn.Write(reqBytes)
+	if _, err := c.conn.Write(reqBytes); err != nil {
+		return nil, err
+	}
 
 	respBytes, err := c.reader.ReadBytes('\n')
 	if err != nil {
@@ -48,8 +56,34 @@ func (c *Client) Send(action, token string, payload interface{}) (*protocol.Resp
 	}
 
 	var resp protocol.Response
-	json.Unmarshal(respBytes, &resp)
+	if err := json.Unmarshal(respBytes, &resp); err != nil {
+		return nil, err
+	}
 	return &resp, nil
+}
+
+// Send envia a requisição. Se a conexão tiver caído (por exemplo, o servidor reiniciou),
+// reconecta uma vez e tenta de novo.
+func (c *Client) Send(action, token string, payload interface{}) (*protocol.Response, error) {
+	var payloadString string
+	if payload != nil {
+		b, _ := json.Marshal(payload)
+		payloadString = string(b)
+	}
+
+	req := protocol.Request{Action: action, Token: token, Data: payloadString}
+	reqBytes, _ := json.Marshal(req)
+	reqBytes = append(reqBytes, '\n')
+
+	resp, err := c.roundTrip(reqBytes)
+	if err == nil {
+		return resp, nil
+	}
+
+	if cerr := c.connect(); cerr != nil {
+		return nil, fmt.Errorf("servidor indisponível: %w", cerr)
+	}
+	return c.roundTrip(reqBytes)
 }
 
 func (c *Client) Close() {
@@ -64,7 +98,7 @@ func main() {
 	fmt.Println("================================================================")
 	fmt.Println("           SISTEMA DE CARONAS DISTRIBUÍDO - PASSAGEIRO          ")
 	fmt.Println("================================================================")
-	
+
 	fmt.Print(" Digite seu Token de Passageiro: ")
 	scanner.Scan()
 	passengerToken := strings.TrimSpace(scanner.Text())
@@ -158,7 +192,11 @@ func handleSearchAndBook(client *Client, scanner *bufio.Scanner, token string) {
 	}
 
 	resp, err := client.Send(protocol.ActionSearchItinerary, token, searchPayload)
-	if err != nil || resp.Status != "SUCCESS" {
+	if err != nil {
+		fmt.Printf("\n[ ERRO]: %v\n", err)
+		return
+	}
+	if resp.Status != "SUCCESS" {
 		fmt.Printf("\n[ ERRO]: %s\n", resp.Message)
 		return
 	}
@@ -222,7 +260,11 @@ func handleSearchAndBook(client *Client, scanner *bufio.Scanner, token string) {
 
 func handleListBookings(client *Client, token string) {
 	resp, err := client.Send(protocol.ActionListBookings, token, nil)
-	if err != nil || resp.Status != "SUCCESS" {
+	if err != nil {
+		fmt.Printf("\n[ ERRO] Não foi possível carregar as suas reservas: %v\n", err)
+		return
+	}
+	if resp.Status != "SUCCESS" {
 		fmt.Println("\n[ ERRO] Não foi possível carregar as suas reservas.")
 		return
 	}

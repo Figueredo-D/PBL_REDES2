@@ -12,7 +12,7 @@ import (
 	"github.com/Figueredo-D/PBL_REDES/internal/protocol"
 )
 
-// apiError é o formato padrão de erro da API interna, conforme o contrato em docs.
+// apiError é o formato padrão de erro da API interna.
 type apiError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
@@ -27,7 +27,6 @@ type internalSegmentDTO struct {
 }
 
 // internalRideDTO é a representação de uma carona na API interna.
-// Usamos um DTO em vez de serializar domain.Ride diretamente, para copiar os dados sob a trava de leitura da carona.
 type internalRideDTO struct {
 	ID          string               `json:"id"`
 	CompanyID   string               `json:"company_id"`
@@ -40,7 +39,6 @@ type internalRideDTO struct {
 }
 
 // internalDecisionDTO é a resposta de GET /internal/transactions/decision.
-// Decision pode ser COMMIT, ABORT, IN_PROGRESS ou UNKNOWN (este nó nunca registrou a transação).
 type internalDecisionDTO struct {
 	TransactionID string `json:"transaction_id"`
 	Decision      string `json:"decision"`
@@ -48,13 +46,13 @@ type internalDecisionDTO struct {
 }
 
 // StartInternalHTTP sobe a API REST interna do nó em um endereço separado do TCP dos clientes.
-// Deve ser chamada antes de Start(), que bloqueia a execução.
 func (s *Server) StartInternalHTTP(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/rides", s.handleInternalRides)
 	mux.HandleFunc("/internal/prepare", s.handleInternal2PC(protocol.Action2PCPrepare))
 	mux.HandleFunc("/internal/commit", s.handleInternal2PC(protocol.Action2PCCommit))
 	mux.HandleFunc("/internal/abort", s.handleInternal2PC(protocol.Action2PCAbort))
+	mux.HandleFunc("/internal/release", s.handleInternalRelease)
 	mux.HandleFunc("/internal/transactions/decision", s.handleInternalDecision)
 
 	l, err := net.Listen("tcp", addr)
@@ -102,8 +100,6 @@ func (s *Server) handleInternalRides(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleInternal2PC implementa POST /internal/prepare, /internal/commit e /internal/abort.
-// A requisição passa pelo mesmo Single Worker usado pelo TCP, então a lógica de participante
-// continua em um único lugar (o dispatch) e a ordem de processamento permanece única.
 func (s *Server) handleInternal2PC(action string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -125,7 +121,7 @@ func (s *Server) handleInternal2PC(action string) http.HandlerFunc {
 
 		if action == protocol.Action2PCPrepare {
 			var data protocol.TwoPCPrepareData
-			if jerr := json.Unmarshal(body, &data); jerr != nil {
+			if err := json.Unmarshal(body, &data); err != nil {
 				writeAPIError(w, http.StatusBadRequest, "INVALID_DATA", "corpo do prepare inválido")
 				return
 			}
@@ -157,8 +153,58 @@ func (s *Server) handleInternal2PC(action string) http.HandlerFunc {
 	}
 }
 
+// handleInternalRelease implementa POST /internal/release.
+// A devolução é executada pelo Single Worker e é idempotente por BookingID.
+func (s *Server) handleInternalRelease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAPIError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "use o método POST")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_DATA", "não foi possível ler o corpo da requisição")
+		return
+	}
+
+	var data protocol.ReleaseSeatsData
+	if err := json.Unmarshal(body, &data); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_DATA", "corpo da devolução de vagas inválido")
+		return
+	}
+	if data.BookingID == "" {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_DATA", "booking_id é obrigatório")
+		return
+	}
+
+	refs := make([]domain.SegmentRef, 0, len(data.Segments))
+	for _, seg := range data.Segments {
+		refs = append(refs, domain.SegmentRef{
+			RideID: seg.RideID,
+			From:   seg.From,
+			To:     seg.To,
+		})
+	}
+
+	var released int
+	err = s.reqManager.Submit(func() error {
+		released = s.repo.ApplyRelease(data.BookingID, refs)
+		s.saveState()
+		return nil
+	})
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "WORKER_EXECUTION_FAILED", err.Error())
+		return
+	}
+
+	writeAPIJSON(w, http.StatusOK, protocol.Response{
+		Status:  "SUCCESS",
+		Message: "Devolução de vagas processada.",
+		Data:    fmt.Sprintf(`{"released_segments":%d}`, released),
+	})
+}
+
 // handleInternalDecision implementa GET /internal/transactions/decision?transaction_id=TX_...
-// Informa a decisão que este nó conhece para a transação. Como só lê o registro, não passa pelo worker.
 func (s *Server) handleInternalDecision(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeAPIError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "use o método GET")
@@ -183,7 +229,7 @@ func (s *Server) handleInternalDecision(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// toInternalRideDTO copia os dados da carona sob a trava de leitura, evitando leitura concorrente com reservas.
+// toInternalRideDTO copia os dados da carona sob a trava de leitura.
 func toInternalRideDTO(ride *domain.Ride) internalRideDTO {
 	ride.RLock()
 	defer ride.RUnlock()
@@ -213,7 +259,7 @@ func toInternalRideDTO(ride *domain.Ride) internalRideDTO {
 func writeAPIJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func writeAPIError(w http.ResponseWriter, status int, code, message string) {

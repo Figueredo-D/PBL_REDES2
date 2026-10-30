@@ -23,19 +23,18 @@ type txIDData struct {
 
 type Server struct {
 	address        string
-	id             string // Identificador único deste servidor no consórcio
+	id             string
 	listener       net.Listener
 	repo           *domain.RideRepository
-	reqManager     *concurrency.RequestManager // Gestor de Fila de Prioridade com Single Worker
-	clusterManager *cluster.ClusterManager     // Gestor de comunicação inter-nós do consórcio
-	txLog          *domain.TxLog               // Registro das transações 2PC deste nó (pendentes, decisões e coordenadores)
-	dataPath       string                      // Arquivo JSON deste nó (ex: data/SERVER_A/estado.json)
+	reqManager     *concurrency.RequestManager
+	clusterManager *cluster.ClusterManager
+	txLog          *domain.TxLog
+	dataPath       string
 	mu             sync.Mutex
 	active         bool
 }
 
-// NewServer carrega o estado salvo deste nó (ou começa vazio na primeira execução) e monta o servidor.
-// O registro de transações fica no mesmo diretório do estado, em txlog.json.
+// NewServer carrega o estado salvo deste nó e monta o servidor.
 func NewServer(address string, serverID string, peers map[string]string, dataPath string) (*Server, error) {
 	repo, err := domain.LoadRideRepository(serverID, dataPath)
 	if err != nil {
@@ -59,17 +58,18 @@ func NewServer(address string, serverID string, peers map[string]string, dataPat
 	}, nil
 }
 
-// saveState grava o estado atual do nó em disco. Deve ser chamada dentro do Single Worker, logo após uma mudança.
+// saveState grava o estado atual do nó em disco.
 func (s *Server) saveState() {
 	if err := s.repo.SaveToFile(s.dataPath); err != nil {
 		fmt.Printf("[SERVER %s] Aviso: falha ao salvar estado: %v\n", s.id, err)
 	}
 }
 
-// recordDecision grava a decisão global da transação antes de ela ser enviada aos participantes.
+// recordDecision grava a decisão global antes de avisar os participantes.
 func (s *Server) recordDecision(txID, decision string) {
 	if err := s.txLog.RecordDecision(txID, decision); err != nil {
-		fmt.Printf("[SERVER %s] Aviso: falha ao gravar decisão %s da transação %s: %v\n", s.id, decision, txID, err)
+		fmt.Printf("[SERVER %s] Aviso: falha ao gravar decisão %s da transação %s: %v\n",
+			s.id, decision, txID, err)
 	}
 }
 
@@ -92,7 +92,6 @@ func (s *Server) Start() error {
 			fmt.Printf("[SERVER] Erro ao aceitar conexão: %v\n", err)
 			continue
 		}
-
 		go s.handleConnection(conn)
 	}
 
@@ -102,7 +101,6 @@ func (s *Server) Start() error {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	remoteAddr := conn.RemoteAddr().String()
-
 	reader := bufio.NewReader(conn)
 
 	for {
@@ -124,22 +122,21 @@ func (s *Server) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		resp := s.route(req)
-		s.sendResponse(conn, resp)
+		s.sendResponse(conn, s.route(req))
 	}
 }
 
-// route decide onde cada ação é executada. Ações que chamam outros nós (busca e 2PC do coordenador)
-// rodam fora do Single Worker; o worker só recebe trabalho local e rápido.
+// route encaminha operações que fazem chamadas de rede para fora do Single Worker.
 func (s *Server) route(req protocol.Request) protocol.Response {
 	switch req.Action {
 	case protocol.ActionSearchItinerary:
 		return s.handleSearch(req)
 	case protocol.ActionBookItinerary:
 		return s.handleBook(req)
+	case protocol.ActionCancelBooking:
+		return s.handleCancelBooking(req)
 	}
 
-	// Demais ações são locais: passam pelo worker, na ordem da fila de prioridade
 	var resp protocol.Response
 	err := s.reqManager.Submit(func() error {
 		resp = s.dispatch(req)
@@ -155,15 +152,13 @@ func (s *Server) route(req protocol.Request) protocol.Response {
 	return resp
 }
 
-// handleSearch monta a busca unificada. A leitura local passa pelo worker; a consulta aos peers via REST
-// acontece fora dele, para não prender o worker enquanto espera a rede.
+// handleSearch combina as caronas locais com as dos peers.
 func (s *Server) handleSearch(req protocol.Request) protocol.Response {
 	var data protocol.SearchItineraryData
 	if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
 		return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de busca inválido."}
 	}
 
-	// 1. Leitura local dentro do worker
 	var localRides []*domain.Ride
 	if err := s.reqManager.Submit(func() error {
 		localRides = s.repo.ListByDate(data.Date)
@@ -172,33 +167,29 @@ func (s *Server) handleSearch(req protocol.Request) protocol.Response {
 		return protocol.Response{Status: "ERROR", Code: "WORKER_EXECUTION_FAILED", Message: err.Error()}
 	}
 
-	// 2. Repositório temporário unificado, preservando os IDs e as vagas originais
 	tempRepo := domain.NewRideRepository(s.id)
-	for _, r := range localRides {
-		tempRepo.AddWithID(r)
+	for _, ride := range localRides {
+		tempRepo.AddWithID(ride)
 	}
 
-	// 3. Consulta os peers via REST fora do worker. Uma falha de peer é registrada e a busca segue.
 	for peerID := range s.clusterManager.Peers {
 		peerRides, err := s.clusterManager.ListRidesByDateREST(peerID, data.Date)
 		if err != nil {
 			fmt.Printf("[SERVER %s] Peer %s indisponível na busca: %v\n", s.id, peerID, err)
 			continue
 		}
-		for _, r := range peerRides {
-			tempRepo.AddWithID(r)
+		for _, ride := range peerRides {
+			tempRepo.AddWithID(ride)
 		}
 	}
 
-	filter := domain.SearchFilter{
+	itineraries := tempRepo.SearchItineraries(domain.SearchFilter{
 		Origin:      data.Origin,
 		Destination: data.Destination,
 		Date:        data.Date,
-	}
+	})
 
-	itineraries := tempRepo.SearchItineraries(filter)
 	jsonResult, _ := json.Marshal(itineraries)
-
 	return protocol.Response{
 		Status:  "SUCCESS",
 		Message: fmt.Sprintf("Encontradas %d opção(ões).", len(itineraries)),
@@ -206,26 +197,18 @@ func (s *Server) handleSearch(req protocol.Request) protocol.Response {
 	}
 }
 
-// handleBook executa o papel de coordenador do 2PC. Gera o timestamp de Lamport da transação e o envia
-// em todos os prepares. Somente as operações locais entram no worker; as chamadas REST saem dele.
-// A decisão global é gravada no TxLog antes de qualquer COMMIT ou ABORT ser enviado.
+// handleBook executa a reserva distribuída por 2PC.
 func (s *Server) handleBook(req protocol.Request) protocol.Response {
 	var itin domain.ItineraryResult
 	if err := json.Unmarshal([]byte(req.Data), &itin); err != nil {
 		return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de reserva inválido."}
 	}
-
-	// Itinerário vazio não pode ser confirmado: senão todos os peers votariam COMMIT sem reservar nada
 	if len(itin.Segments) == 0 {
 		return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Itinerário sem trechos."}
 	}
 
-	// Timestamp de Lamport desta transação. Define a precedência em todos os nós envolvidos.
 	lamportTS := s.reqManager.NextTimestamp()
 	transactionID := fmt.Sprintf("TX_%d", time.Now().UnixNano())
-
-	// Marca a transação como em andamento antes de qualquer reserva.
-	// Se o coordenador cair sem decisão gravada, a recuperação sabe que ela não foi decidida.
 	s.txLog.BeginCoordination(transactionID)
 
 	refs := make([]domain.SegmentRef, 0, len(itin.Segments))
@@ -233,7 +216,6 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 		refs = append(refs, domain.SegmentRef{RideID: seg.RideID, From: seg.From, To: seg.To})
 	}
 
-	// 1. Fase 1 local: reserva os trechos locais pelo TxLog, dentro do worker, na ordem da transação
 	var localErr error
 	if err := s.reqManager.SubmitAt(lamportTS, s.id, func() error {
 		localErr = s.txLog.PrepareWithCoordinator(s.repo, transactionID, s.id, refs)
@@ -246,22 +228,21 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 	}
 
 	successPrepare := localErr == nil
-	votedPeers := []string{}     // peers que responderam VOTE_COMMIT
-	contactedPeers := []string{} // peers que receberam PREPARE, mesmo que a resposta tenha falhado
+	votedPeers := []string{}
+	contactedPeers := []string{}
 
-	// 2. Fase 1 remota: envia PREPARE via REST fora do worker
 	if successPrepare {
-		var protoSegments []protocol.SegmentInfo
-		for _, sSeg := range itin.Segments {
+		protoSegments := make([]protocol.SegmentInfo, 0, len(itin.Segments))
+		for _, seg := range itin.Segments {
 			protoSegments = append(protoSegments, protocol.SegmentInfo{
-				RideID:         sSeg.RideID,
-				CompanyID:      sSeg.CompanyID,
-				DriverToken:    sSeg.DriverToken,
-				From:           sSeg.From,
-				To:             sSeg.To,
-				DepartureTime:  sSeg.DepartureTime,
-				Price:          sSeg.Price,
-				AvailableSeats: sSeg.AvailableSeats,
+				RideID:         seg.RideID,
+				CompanyID:      seg.CompanyID,
+				DriverToken:    seg.DriverToken,
+				From:           seg.From,
+				To:             seg.To,
+				DepartureTime:  seg.DepartureTime,
+				Price:          seg.Price,
+				AvailableSeats: seg.AvailableSeats,
 			})
 		}
 
@@ -279,9 +260,16 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 			},
 		}
 
-		for peerID := range s.clusterManager.Peers {
-			contactedPeers = append(contactedPeers, peerID)
+		// Envia prepare apenas aos nós que possuem trechos deste itinerário.
+		peerSet := make(map[string]bool)
+		for _, seg := range itin.Segments {
+			if seg.CompanyID != "" && seg.CompanyID != s.id {
+				peerSet[seg.CompanyID] = true
+			}
+		}
 
+		for peerID := range peerSet {
+			contactedPeers = append(contactedPeers, peerID)
 			resp, err := s.clusterManager.PrepareREST(peerID, prepareData)
 			if err != nil || resp.Status != "VOTE_COMMIT" {
 				successPrepare = false
@@ -291,12 +279,9 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 		}
 	}
 
-	// 3. Decisão global: ABORT
 	if !successPrepare {
-		// Grava a decisão antes de avisar qualquer participante
 		s.recordDecision(transactionID, domain.DecisionAbort)
 
-		// Devolve somente as vagas locais que este prepare reservou
 		if err := s.reqManager.Submit(func() error {
 			s.txLog.Abort(s.repo, transactionID)
 			s.saveState()
@@ -305,7 +290,6 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 			fmt.Printf("[SERVER %s] Aviso: abort local falhou na transação %s: %v\n", s.id, transactionID, err)
 		}
 
-		// O ABORT vai para todos os peers contatados, inclusive os que falharam por timeout
 		for _, peerID := range contactedPeers {
 			if err := s.clusterManager.AbortREST(peerID, transactionID); err != nil {
 				fmt.Printf("[SERVER %s] Aviso: abort não confirmado em %s: %v\n", s.id, peerID, err)
@@ -314,16 +298,13 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 		return protocol.Response{Status: "ERROR", Code: "2PC_ABORTED", Message: "Transação abortada: falha ao garantir vagas."}
 	}
 
-	// 4. Decisão global: COMMIT. Grava antes de enviar aos peers que votaram.
 	s.recordDecision(transactionID, domain.DecisionCommit)
-
 	for _, peerID := range votedPeers {
 		if err := s.clusterManager.CommitREST(peerID, transactionID); err != nil {
 			fmt.Printf("[SERVER %s] Aviso: commit não confirmado em %s: %v\n", s.id, peerID, err)
 		}
 	}
 
-	// Efetiva localmente e salva a reserva dentro do worker
 	var bookingID string
 	if err := s.reqManager.Submit(func() error {
 		s.txLog.Commit(transactionID)
@@ -335,7 +316,6 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 	}
 
 	fmt.Printf("[SERVER %s] Transação 2PC bem-sucedida! Reserva %s confirmada.\n", s.id, bookingID)
-
 	return protocol.Response{
 		Status:  "SUCCESS",
 		Message: fmt.Sprintf("Reserva confirmada sob o ID %s via 2PC.", bookingID),
@@ -343,10 +323,88 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 	}
 }
 
-// dispatch executa as ações locais. Roda sempre dentro do Single Worker.
+// handleCancelBooking marca a reserva como cancelada e pede a devolução das vagas
+// às empresas que possuem trechos nela. Falhas ficam registradas para nova tentativa.
+func (s *Server) handleCancelBooking(req protocol.Request) protocol.Response {
+	var data protocol.CancelBookingData
+	if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
+		return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de cancelamento inválido."}
+	}
+
+	var booking domain.Booking
+	if err := s.reqManager.Submit(func() error {
+		var err error
+		booking, err = s.repo.BeginCancelBooking(data.BookingID, req.Token)
+		if err == nil {
+			s.saveState()
+		}
+		return err
+	}); err != nil {
+		return protocol.Response{Status: "ERROR", Code: "CANCEL_FAILED", Message: err.Error()}
+	}
+
+	companies := make(map[string]bool)
+	for _, companyID := range booking.PendingReleases {
+		companies[companyID] = true
+	}
+
+	// Garante que cada empresa é processada uma vez, mesmo se houver vários trechos seus.
+	for companyID := range companies {
+		var releaseErr error
+
+		if companyID == s.id {
+			refs := make([]domain.SegmentRef, 0)
+			for _, seg := range booking.Itinerary.Segments {
+				if seg.CompanyID == s.id {
+					refs = append(refs, domain.SegmentRef{RideID: seg.RideID, From: seg.From, To: seg.To})
+				}
+			}
+
+			releaseErr = s.reqManager.Submit(func() error {
+				s.repo.ApplyRelease(booking.ID, refs)
+				s.repo.CompleteRelease(booking.ID, companyID)
+				s.saveState()
+				return nil
+			})
+		} else {
+			releaseData := protocol.ReleaseSeatsData{
+				BookingID: booking.ID,
+				Segments:  make([]protocol.SegmentInfo, 0, len(booking.Itinerary.Segments)),
+			}
+			for _, seg := range booking.Itinerary.Segments {
+				releaseData.Segments = append(releaseData.Segments, protocol.SegmentInfo{
+					RideID:    seg.RideID,
+					CompanyID: seg.CompanyID,
+					From:      seg.From,
+					To:        seg.To,
+				})
+			}
+
+			releaseErr = s.clusterManager.ReleaseREST(companyID, releaseData)
+			if releaseErr == nil {
+				releaseErr = s.reqManager.Submit(func() error {
+					s.repo.CompleteRelease(booking.ID, companyID)
+					s.saveState()
+					return nil
+				})
+			}
+		}
+
+		if releaseErr != nil {
+			fmt.Printf("[SERVER %s] Devolução da reserva %s pendente em %s: %v\n",
+				s.id, booking.ID, companyID, releaseErr)
+		}
+	}
+
+	return protocol.Response{
+		Status:  "SUCCESS",
+		Message: "Reserva cancelada. As devoluções de vagas pendentes serão tentadas novamente.",
+	}
+}
+
+// dispatch executa as ações locais dentro do Single Worker.
 func (s *Server) dispatch(req protocol.Request) protocol.Response {
 	switch req.Action {
-
 	case protocol.ActionOfferRide:
 		var data protocol.OfferRideData
 		if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
@@ -361,7 +419,6 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		rideID := s.repo.Add(ride)
 		s.saveState()
 		fmt.Printf("[SERVER %s] Carona %s ofertada por %s.\n", s.id, rideID, req.Token)
-
 		return protocol.Response{
 			Status:  "SUCCESS",
 			Message: fmt.Sprintf("Carona registrada sob o ID %s.", rideID),
@@ -370,19 +427,17 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 
 	case protocol.ActionListRides:
 		rides := s.repo.ListByDriver(req.Token)
-		bytes, _ := json.Marshal(rides)
-		return protocol.Response{Status: "SUCCESS", Data: string(bytes)}
+		data, _ := json.Marshal(rides)
+		return protocol.Response{Status: "SUCCESS", Data: string(data)}
 
 	case protocol.ActionCancelRide:
 		var data protocol.CancelRideData
 		if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
 			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload inválido."}
 		}
-
 		if err := s.repo.CancelRide(data.RideID, req.Token); err != nil {
 			return protocol.Response{Status: "ERROR", Code: "CANCEL_FAILED", Message: err.Error()}
 		}
-
 		s.saveState()
 		fmt.Printf("[SERVER %s] Carona %s cancelada por %s.\n", s.id, data.RideID, req.Token)
 		return protocol.Response{Status: "SUCCESS", Message: "Carona cancelada com sucesso."}
@@ -391,13 +446,11 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		var data struct {
 			Date string `json:"date"`
 		}
-		json.Unmarshal([]byte(req.Data), &data)
-
+		_ = json.Unmarshal([]byte(req.Data), &data)
 		rides := s.repo.ListByDate(data.Date)
-		bytes, _ := json.Marshal(rides)
-		return protocol.Response{Status: "SUCCESS", Data: string(bytes)}
+		result, _ := json.Marshal(rides)
+		return protocol.Response{Status: "SUCCESS", Data: string(result)}
 
-	// --- 2PC: PAPEL DE PARTICIPANTE ---
 	case protocol.Action2PCPrepare:
 		var data protocol.TwoPCPrepareData
 		if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
@@ -408,13 +461,10 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		for _, seg := range data.Itinerary.Segments {
 			refs = append(refs, domain.SegmentRef{RideID: seg.RideID, From: seg.From, To: seg.To})
 		}
-
-		// O TxLog reserva apenas os trechos locais e registra o que foi reservado para este abort
 		if err := s.txLog.PrepareWithCoordinator(s.repo, data.TransactionID, data.CoordinatorID, refs); err != nil {
 			return protocol.Response{Status: "VOTE_ABORT", Message: "Vagas esgotadas neste nó."}
 		}
 		s.saveState()
-
 		return protocol.Response{Status: "VOTE_COMMIT", Message: "Preparado para confirmar."}
 
 	case protocol.Action2PCCommit:
@@ -422,7 +472,6 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
 			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de commit inválido."}
 		}
-
 		s.txLog.Commit(data.TransactionID)
 		s.saveState()
 		fmt.Printf("[SERVER %s] Recebido GLOBAL_COMMIT da transação %s.\n", s.id, data.TransactionID)
@@ -433,24 +482,16 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
 			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de abort inválido."}
 		}
-
 		released := s.txLog.Abort(s.repo, data.TransactionID)
 		s.saveState()
-		fmt.Printf("[SERVER %s] Recebido GLOBAL_ABORT da transação %s. Trechos devolvidos: %d.\n", s.id, data.TransactionID, released)
+		fmt.Printf("[SERVER %s] Recebido GLOBAL_ABORT da transação %s. Trechos devolvidos: %d.\n",
+			s.id, data.TransactionID, released)
 		return protocol.Response{Status: "SUCCESS", Message: "Abort efetivado."}
-
-	case protocol.ActionCancelBooking:
-		var data protocol.CancelBookingData
-		if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
-			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de cancelamento inválido."}
-		}
-
-		return protocol.Response{Status: "SUCCESS", Message: "Solicitação de cancelamento processada."}
 
 	case protocol.ActionListBookings:
 		bookings := s.repo.ListBookingsByPassenger(req.Token)
-		bytes, _ := json.Marshal(bookings)
-		return protocol.Response{Status: "SUCCESS", Data: string(bytes)}
+		data, _ := json.Marshal(bookings)
+		return protocol.Response{Status: "SUCCESS", Data: string(data)}
 
 	default:
 		return protocol.Response{
@@ -464,5 +505,5 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 func (s *Server) sendResponse(conn net.Conn, resp protocol.Response) {
 	data, _ := json.Marshal(resp)
 	data = append(data, '\n')
-	conn.Write(data)
+	_, _ = conn.Write(data)
 }
