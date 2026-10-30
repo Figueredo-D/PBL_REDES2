@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Figueredo-D/PBL_REDES/internal/cluster"
@@ -26,6 +28,7 @@ type Server struct {
 	address        string
 	id             string
 	listener       net.Listener
+	httpServer     *http.Server
 	repo           *domain.RideRepository
 	reqManager     *concurrency.RequestManager
 	clusterManager *cluster.ClusterManager
@@ -33,6 +36,13 @@ type Server struct {
 	dataPath       string
 	mu             sync.Mutex
 	active         bool
+	txSeq          uint64
+}
+
+// newTransactionID gera um identificador único para transações coordenadas por este nó.
+func (s *Server) newTransactionID() string {
+	seq := atomic.AddUint64(&s.txSeq, 1)
+	return fmt.Sprintf("%s_TX_%d_%d", s.id, time.Now().UnixNano(), seq)
 }
 
 // NewServer carrega o estado salvo deste nó e monta o servidor.
@@ -97,6 +107,19 @@ func (s *Server) Start() error {
 	}
 
 	return nil
+}
+
+// Stop interrompe a escuta TCP e a API REST do servidor (útil para injeção de falhas e shutdown limpo).
+func (s *Server) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active = false
+	if s.listener != nil {
+		_ = s.listener.Close()
+	}
+	if s.httpServer != nil {
+		_ = s.httpServer.Close()
+	}
 }
 
 func (s *Server) handleConnection(conn net.Conn) {

@@ -66,6 +66,7 @@ func (s *Server) StartInternalHTTP(addr string) error {
 		WriteTimeout: 5 * time.Second,
 	}
 
+	s.httpServer = httpServer
 	fmt.Printf("[SERVER %s] API REST interna escutando em http://%s\n", s.id, addr)
 
 	go func() {
