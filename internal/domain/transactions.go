@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,25 @@ const (
 	DecisionInProgress = "IN_PROGRESS"
 )
 
+var (
+	// ErrLowerPriority é retornado quando um prepare é recusado porque uma transação com menor
+	// tupla (LamportTime, CoordinatorID) já detém ou disputa a vaga.
+	ErrLowerPriority = errors.New("existe transação de maior prioridade para o mesmo trecho")
+
+	// ErrNoSeats é retornado quando todas as vagas foram confirmadas em definitivo e estão esgotadas.
+	ErrNoSeats = errors.New("vagas esgotadas neste trecho")
+)
+
+// HasHigherPriority compara duas transações pela tupla (LamportTime, CoordinatorID).
+// Retorna true se a transação A possui maior precedência que B (ou seja, menor tupla de Lamport).
+// Em caso de empate no timestamp lógico, desempata deterministicamente por ordem lexicográfica do ServerID.
+func HasHigherPriority(lamportA int64, coordA string, lamportB int64, coordB string) bool {
+	if lamportA != lamportB {
+		return lamportA < lamportB
+	}
+	return coordA < coordB
+}
+
 // SegmentRef identifica um trecho envolvido em uma transação 2PC.
 type SegmentRef struct {
 	RideID string `json:"ride_id"`
@@ -24,15 +44,16 @@ type SegmentRef struct {
 
 // txLogArquivo é o conteúdo gravado em disco. Cada nó tem o seu próprio txlog.json.
 type txLogArquivo struct {
-	Pending      map[string][]SegmentRef `json:"pending"`      // transações preparadas, aguardando commit ou abort
-	Aborted      map[string]bool         `json:"aborted"`      // transações abortadas, para bloquear um prepare atrasado
-	Coordinators map[string]string       `json:"coordinators"` // txID -> ID do coordenador (quem consultar na recuperação)
-	Decisions    map[string]string       `json:"decisions"`    // txID -> COMMIT ou ABORT, gravado antes de qualquer aviso
-	InProgress   map[string]bool         `json:"in_progress"`  // transações que este nó está coordenando sem decisão ainda
+	Pending      map[string][]SegmentRef `json:"pending"`                // transações preparadas, aguardando commit ou abort
+	Aborted      map[string]bool         `json:"aborted"`                // transações abortadas, para bloquear um prepare atrasado
+	Coordinators map[string]string       `json:"coordinators"`           // txID -> ID do coordenador (quem consultar na recuperação)
+	Decisions    map[string]string       `json:"decisions"`              // txID -> COMMIT ou ABORT, gravado antes de qualquer aviso
+	InProgress   map[string]bool         `json:"in_progress"`            // transações que este nó está coordenando sem decisão ainda
+	LamportTimes map[string]int64        `json:"lamport_times,omitempty"` // txID -> timestamp lógico de Lamport da transação
 }
 
 // TxLog registra o estado das transações 2PC deste nó: reservas locais, coordenadores,
-// decisões globais e transações em andamento. Toda mudança é gravada em disco logo em seguida.
+// decisões globais, relógios de Lamport e transações em andamento. Toda mudança é gravada em disco logo em seguida.
 type TxLog struct {
 	mu           sync.Mutex
 	path         string
@@ -41,6 +62,7 @@ type TxLog struct {
 	coordinators map[string]string
 	decisions    map[string]string
 	inProgress   map[string]bool
+	lamportTimes map[string]int64
 }
 
 // LoadTxLog carrega o registro de transações do arquivo em path.
@@ -54,6 +76,7 @@ func LoadTxLog(path string) (*TxLog, error) {
 		coordinators: make(map[string]string),
 		decisions:    make(map[string]string),
 		inProgress:   make(map[string]bool),
+		lamportTimes: make(map[string]int64),
 	}
 
 	dados, err := os.ReadFile(path)
@@ -84,6 +107,9 @@ func LoadTxLog(path string) (*TxLog, error) {
 	if arq.InProgress != nil {
 		t.inProgress = arq.InProgress
 	}
+	if arq.LamportTimes != nil {
+		t.lamportTimes = arq.LamportTimes
+	}
 
 	return t, nil
 }
@@ -100,6 +126,7 @@ func (t *TxLog) salvarLocked() {
 		Coordinators: t.coordinators,
 		Decisions:    t.decisions,
 		InProgress:   t.inProgress,
+		LamportTimes: t.lamportTimes,
 	}
 
 	dados, err := json.MarshalIndent(arq, "", "  ")
@@ -124,14 +151,21 @@ func (t *TxLog) salvarLocked() {
 	}
 }
 
-// Prepare reserva os trechos locais sem registrar coordenador. Mantido para compatibilidade com o listener atual.
+// Prepare reserva os trechos locais sem registrar coordenador. Mantido para compatibilidade.
 func (t *TxLog) Prepare(repo *RideRepository, txID string, segs []SegmentRef) error {
-	return t.PrepareWithCoordinator(repo, txID, "", segs)
+	return t.PrepareWithPriority(repo, txID, "", 0, segs)
 }
 
 // PrepareWithCoordinator reserva os trechos locais da transação e registra quem é o coordenador.
-// Se um dos trechos falhar, desfaz somente as reservas feitas nesta chamada.
 func (t *TxLog) PrepareWithCoordinator(repo *RideRepository, txID, coordinatorID string, segs []SegmentRef) error {
+	return t.PrepareWithPriority(repo, txID, coordinatorID, 0, segs)
+}
+
+// PrepareWithPriority executa a Fase 1 do 2PC aplicando o critério de precedência de Lamport.
+// Se faltarem vagas em um trecho, verifica se há alguma transação pendente em PREPARED segurando vaga
+// com menor prioridade que a transação atual. Se houver, preempta a de menor prioridade.
+// Caso contrário, recusa o voto com ErrLowerPriority ou ErrNoSeats.
+func (t *TxLog) PrepareWithPriority(repo *RideRepository, txID, coordinatorID string, lamportTime int64, segs []SegmentRef) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -139,7 +173,7 @@ func (t *TxLog) PrepareWithCoordinator(repo *RideRepository, txID, coordinatorID
 		return fmt.Errorf("transação %s já foi abortada", txID)
 	}
 
-	// Prepare repetido: a reserva já existe, então não reserva de novo
+	// Prepare repetido (idempotência): a reserva já existe, então mantém
 	if _, ok := t.pending[txID]; ok {
 		return nil
 	}
@@ -149,13 +183,34 @@ func (t *TxLog) PrepareWithCoordinator(repo *RideRepository, txID, coordinatorID
 		if _, isLocal := repo.GetRide(s.RideID); !isLocal {
 			continue
 		}
-		if err := repo.TryReserveLocalSegment(s.RideID, s.From, s.To); err != nil {
-			// Rollback parcial: devolve apenas o que este prepare reservou
-			for _, r := range reserved {
-				repo.ReleaseLocalSegment(r.RideID, r.From, r.To)
+
+		// 1. Tenta reservar vaga livre diretamente
+		err := repo.TryReserveLocalSegment(s.RideID, s.From, s.To)
+		if err != nil {
+			// Não há vagas livres. Verifica disputa pelo último assento com transações pendentes (PREPARED).
+			preempted := t.tryPreemptLowerPriorityLocked(repo, s, lamportTime, coordinatorID)
+			if !preempted {
+				// Rollback parcial do que esta transação já reservou nesta chamada
+				for _, r := range reserved {
+					repo.ReleaseLocalSegment(r.RideID, r.From, r.To)
+				}
+				// Se há alguma transação pendente segurando vaga com maior prioridade:
+				if t.hasPendingOnSegmentLocked(s) {
+					return ErrLowerPriority
+				}
+				return ErrNoSeats
 			}
-			return err
+
+			// Preempção bem-sucedida! Uma vaga foi liberada pela transação derrotada na precedência.
+			// Agora reserva a vaga para a transação vencedora.
+			if errReserve := repo.TryReserveLocalSegment(s.RideID, s.From, s.To); errReserve != nil {
+				for _, r := range reserved {
+					repo.ReleaseLocalSegment(r.RideID, r.From, r.To)
+				}
+				return errReserve
+			}
 		}
+
 		reserved = append(reserved, s)
 	}
 
@@ -163,8 +218,61 @@ func (t *TxLog) PrepareWithCoordinator(repo *RideRepository, txID, coordinatorID
 	if coordinatorID != "" {
 		t.coordinators[txID] = coordinatorID
 	}
+	if lamportTime > 0 {
+		t.lamportTimes[txID] = lamportTime
+	}
 	t.salvarLocked()
 	return nil
+}
+
+// tryPreemptLowerPriorityLocked busca entre as transações pendentes uma que esteja segurando vaga
+// no trecho seg e tenha prioridade menor (tupla de Lamport maior) que a candidata atual.
+// Se encontrar, aborta a de menor prioridade e retorna true.
+func (t *TxLog) tryPreemptLowerPriorityLocked(repo *RideRepository, seg SegmentRef, candidateLamport int64, candidateCoord string) bool {
+	var victimTxID string
+	var victimLamport int64 = -1
+	var victimCoord string
+
+	for txID, segs := range t.pending {
+		for _, s := range segs {
+			if s.RideID == seg.RideID && s.From == seg.From && s.To == seg.To {
+				lTime := t.lamportTimes[txID]
+				coord := t.coordinators[txID]
+
+				// Verifica se a transação candidata tem MAIOR prioridade que esta pendente
+				if HasHigherPriority(candidateLamport, candidateCoord, lTime, coord) {
+					// Entre as possíveis vítimas, escolhemos a de MENOR prioridade de todas
+					if victimTxID == "" || HasHigherPriority(victimLamport, victimCoord, lTime, coord) {
+						victimTxID = txID
+						victimLamport = lTime
+						victimCoord = coord
+					}
+				}
+				break
+			}
+		}
+	}
+
+	if victimTxID != "" {
+		fmt.Printf("[TXLOG] Precedência de Lamport: Preemptando transação %s (Lamport=%d, Coord=%s) em favor de (Lamport=%d, Coord=%s) no trecho %s -> %s\n",
+			victimTxID, victimLamport, victimCoord, candidateLamport, candidateCoord, seg.From, seg.To)
+		t.abortLocked(repo, victimTxID)
+		return true
+	}
+
+	return false
+}
+
+// hasPendingOnSegmentLocked verifica se há qualquer transação pendente segurando vaga no trecho.
+func (t *TxLog) hasPendingOnSegmentLocked(seg SegmentRef) bool {
+	for _, segs := range t.pending {
+		for _, s := range segs {
+			if s.RideID == seg.RideID && s.From == seg.From && s.To == seg.To {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // BeginCoordination marca uma transação como em andamento neste nó, antes de qualquer reserva.
@@ -253,14 +361,20 @@ func (t *TxLog) ResolveInterruptedCoordinations(repo *RideRepository) []string {
 }
 
 // Commit efetiva a transação: as vagas continuam reservadas e o registro de pendência é removido.
-// Chamadas repetidas não causam efeito.
-func (t *TxLog) Commit(txID string) {
+// Retorna erro caso a transação já tenha sido abortada anteriormente (por exemplo, preemptada por Lamport).
+func (t *TxLog) Commit(txID string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if t.aborted[txID] {
+		return fmt.Errorf("transação %s já foi abortada por perda de precedência ou cancelamento", txID)
+	}
+
 	delete(t.pending, txID)
 	delete(t.coordinators, txID)
+	delete(t.lamportTimes, txID)
 	t.salvarLocked()
+	return nil
 }
 
 // Abort desfaz a transação devolvendo as vagas que o prepare reservou neste nó.
@@ -276,7 +390,7 @@ func (t *TxLog) Abort(repo *RideRepository, txID string) int {
 
 // abortLocked faz o trabalho do Abort. Deve ser chamada com t.mu travado e não grava em disco.
 func (t *TxLog) abortLocked(repo *RideRepository, txID string) int {
-	// Marca como abortada, para que um prepare atrasado não reserve vagas depois
+	// Marca como abortada, para que um prepare atrasado ou commit não reserve vagas depois
 	t.aborted[txID] = true
 
 	reserved := t.pending[txID]
@@ -285,5 +399,6 @@ func (t *TxLog) abortLocked(repo *RideRepository, txID string) int {
 	}
 	delete(t.pending, txID)
 	delete(t.coordinators, txID)
+	delete(t.lamportTimes, txID)
 	return len(reserved)
 }

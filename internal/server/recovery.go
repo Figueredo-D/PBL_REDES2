@@ -179,7 +179,7 @@ func (s *Server) aplicarDecisao(txID, decisao string) {
 	var liberadas int
 	if err := s.reqManager.Submit(func() error {
 		if decisao == domain.DecisionCommit {
-			s.txLog.Commit(txID)
+			_ = s.txLog.Commit(txID)
 		} else {
 			liberadas = s.txLog.Abort(s.repo, txID)
 		}

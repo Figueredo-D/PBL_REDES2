@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -208,7 +209,7 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 	}
 
 	lamportTS := s.reqManager.NextTimestamp()
-	transactionID := fmt.Sprintf("TX_%d", time.Now().UnixNano())
+	transactionID := fmt.Sprintf("%s_TX_%d", s.id, time.Now().UnixNano())
 	s.txLog.BeginCoordination(transactionID)
 
 	refs := make([]domain.SegmentRef, 0, len(itin.Segments))
@@ -218,7 +219,7 @@ func (s *Server) handleBook(req protocol.Request) protocol.Response {
 
 	var localErr error
 	if err := s.reqManager.SubmitAt(lamportTS, s.id, func() error {
-		localErr = s.txLog.PrepareWithCoordinator(s.repo, transactionID, s.id, refs)
+		localErr = s.txLog.PrepareWithPriority(s.repo, transactionID, s.id, lamportTS, refs)
 		if localErr == nil {
 			s.saveState()
 		}
@@ -454,15 +455,26 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 	case protocol.Action2PCPrepare:
 		var data protocol.TwoPCPrepareData
 		if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
-			return protocol.Response{Status: "VOTE_ABORT", Message: "Payload de prepare inválido."}
+			return protocol.Response{Status: "VOTE_ABORT", Code: "INVALID_DATA", Message: "Payload de prepare inválido."}
 		}
 
 		refs := make([]domain.SegmentRef, 0, len(data.Itinerary.Segments))
 		for _, seg := range data.Itinerary.Segments {
 			refs = append(refs, domain.SegmentRef{RideID: seg.RideID, From: seg.From, To: seg.To})
 		}
-		if err := s.txLog.PrepareWithCoordinator(s.repo, data.TransactionID, data.CoordinatorID, refs); err != nil {
-			return protocol.Response{Status: "VOTE_ABORT", Message: "Vagas esgotadas neste nó."}
+		if err := s.txLog.PrepareWithPriority(s.repo, data.TransactionID, data.CoordinatorID, data.LamportTime, refs); err != nil {
+			if errors.Is(err, domain.ErrLowerPriority) {
+				return protocol.Response{
+					Status:  "VOTE_ABORT",
+					Code:    "LOWER_PRIORITY",
+					Message: "Existe transação de maior prioridade para o mesmo trecho.",
+				}
+			}
+			return protocol.Response{
+				Status:  "VOTE_ABORT",
+				Code:    "NO_SEATS",
+				Message: err.Error(),
+			}
 		}
 		s.saveState()
 		return protocol.Response{Status: "VOTE_COMMIT", Message: "Preparado para confirmar."}
@@ -472,7 +484,9 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
 			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload de commit inválido."}
 		}
-		s.txLog.Commit(data.TransactionID)
+		if err := s.txLog.Commit(data.TransactionID); err != nil {
+			return protocol.Response{Status: "ERROR", Code: "TRANSACTION_ABORTED", Message: err.Error()}
+		}
 		s.saveState()
 		fmt.Printf("[SERVER %s] Recebido GLOBAL_COMMIT da transação %s.\n", s.id, data.TransactionID)
 		return protocol.Response{Status: "SUCCESS", Message: "Commit efetivado."}
