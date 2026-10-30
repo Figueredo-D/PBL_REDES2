@@ -14,9 +14,8 @@ const recoveryInterval = 5 * time.Second
 // decisionUnknown é devolvido quando o coordenador não conhece a transação.
 const decisionUnknown = "UNKNOWN"
 
-// StartRecovery inicia a recuperação em segundo plano. Primeiro resolve coordenações
-// interrompidas e tenta processar pendências existentes; depois repete periodicamente
-// a recuperação do 2PC e das devoluções de vagas.
+// StartRecovery inicia a recuperação do 2PC e das devoluções de vagas pendentes.
+// Deve ser chamada antes de Start(), que bloqueia a execução.
 func (s *Server) StartRecovery() {
 	go func() {
 		s.resolveOwnInterrupted()
@@ -34,11 +33,9 @@ func (s *Server) StartRecovery() {
 }
 
 // resolveOwnInterrupted trata as transações que este nó coordenava sem decisão gravada.
-// Como o COMMIT só é enviado depois de gravar a decisão, essas transações são abortadas
-// com segurança. Os participantes descobrem o ABORT ao consultar o coordenador.
+// Como o COMMIT só é enviado depois de gravar a decisão, essas transações são abortadas com segurança.
 func (s *Server) resolveOwnInterrupted() {
 	var resolvidas []string
-
 	if err := s.reqManager.Submit(func() error {
 		resolvidas = s.txLog.ResolveInterruptedCoordinations(s.repo)
 		if len(resolvidas) > 0 {
@@ -51,8 +48,7 @@ func (s *Server) resolveOwnInterrupted() {
 	}
 
 	for _, txID := range resolvidas {
-		fmt.Printf("[RECOVERY %s] Transação %s estava sem decisão gravada; abortada na recuperação.\n",
-			s.id, txID)
+		fmt.Printf("[RECOVERY %s] Transação %s estava sem decisão gravada; abortada na recuperação.\n", s.id, txID)
 	}
 }
 
@@ -64,57 +60,49 @@ func (s *Server) recoverPending() {
 	for txID, coordID := range pendentes {
 		decisao, err := s.decisaoDoCoordenador(txID, coordID)
 		if err != nil {
-			fmt.Printf("[RECOVERY %s] Decisão da transação %s indisponível (%v). Mantida pendente.\n",
-				s.id, txID, err)
+			fmt.Printf("[RECOVERY %s] Decisão da transação %s indisponível (%v). Mantida pendente.\n", s.id, txID, err)
 			continue
 		}
 
 		switch decisao {
 		case domain.DecisionCommit, domain.DecisionAbort:
 			s.aplicarDecisao(txID, decisao)
-
 		case domain.DecisionInProgress:
 			// O coordenador ainda está decidindo. Aguarda a próxima rodada.
-
 		default:
-			// Não é seguro liberar nem confirmar sem uma decisão conhecida.
-			fmt.Printf("[RECOVERY %s] Coordenador %s não conhece a transação %s. Mantida pendente.\n",
-				s.id, coordID, txID)
+			// Não é seguro liberar nem confirmar se o coordenador não conhece a transação.
+			fmt.Printf("[RECOVERY %s] Coordenador %s não conhece a transação %s. Mantida pendente.\n", s.id, coordID, txID)
 		}
 	}
 }
 
-// recoverPendingReleases tenta novamente as devoluções de vagas que falharam durante
-// um cancelamento, por exemplo, porque o servidor dono de uma carona estava indisponível.
+// recoverPendingReleases tenta novamente as devoluções de vagas de reservas canceladas.
+// A reserva mantém a lista de empresas pendentes persistida; cada empresa concluída é removida
+// dessa lista para que novas rodadas processem apenas o que ainda falta.
 func (s *Server) recoverPendingReleases() {
 	bookings := s.repo.BookingsWithPendingReleases()
 
 	for _, booking := range bookings {
 		for _, companyID := range booking.PendingReleases {
-			if err := s.retryBookingRelease(booking, companyID); err != nil {
-				fmt.Printf(
-					"[RECOVERY %s] Devolução da reserva %s ainda pendente em %s: %v\n",
-					s.id,
-					booking.ID,
-					companyID,
-					err,
-				)
+			if err := s.retryRelease(booking, companyID); err != nil {
+				fmt.Printf("[RECOVERY %s] Devolução da reserva %s ainda pendente em %s: %v\n",
+					s.id, booking.ID, companyID, err)
+				continue
 			}
+
+			fmt.Printf("[RECOVERY %s] Devolução da reserva %s concluída em %s.\n",
+				s.id, booking.ID, companyID)
 		}
 	}
 }
 
-// retryBookingRelease reenvia a devolução para um nó remoto ou executa a devolução
-// localmente. Só remove a pendência depois de confirmar o processamento.
-// O endpoint remoto e ApplyRelease são idempotentes por ID da reserva.
-func (s *Server) retryBookingRelease(booking domain.Booking, companyID string) error {
-	if companyID == "" {
-		return fmt.Errorf("empresa da devolução não informada")
-	}
+// retryRelease tenta devolver as vagas de uma reserva em uma empresa.
+// Em caso de sucesso, registra a conclusão no repositório local.
+func (s *Server) retryRelease(booking domain.Booking, companyID string) error {
+	var err error
 
 	if companyID == s.id {
-		refs := make([]domain.SegmentRef, 0)
-
+		refs := make([]domain.SegmentRef, 0, len(booking.Itinerary.Segments))
 		for _, seg := range booking.Itinerary.Segments {
 			if seg.CompanyID == s.id {
 				refs = append(refs, domain.SegmentRef{
@@ -125,41 +113,46 @@ func (s *Server) retryBookingRelease(booking domain.Booking, companyID string) e
 			}
 		}
 
-		return s.reqManager.Submit(func() error {
+		err = s.reqManager.Submit(func() error {
 			s.repo.ApplyRelease(booking.ID, refs)
 			s.repo.CompleteRelease(booking.ID, companyID)
 			s.saveState()
 			return nil
 		})
+	} else {
+		releaseData := protocol.ReleaseSeatsData{
+			BookingID: booking.ID,
+			Segments:  make([]protocol.SegmentInfo, 0, len(booking.Itinerary.Segments)),
+		}
+
+		for _, seg := range booking.Itinerary.Segments {
+			releaseData.Segments = append(releaseData.Segments, protocol.SegmentInfo{
+				RideID:    seg.RideID,
+				CompanyID: seg.CompanyID,
+				From:      seg.From,
+				To:        seg.To,
+			})
+		}
+
+		err = s.clusterManager.ReleaseREST(companyID, releaseData)
+		if err == nil {
+			err = s.reqManager.Submit(func() error {
+				s.repo.CompleteRelease(booking.ID, companyID)
+				s.saveState()
+				return nil
+			})
+		}
 	}
 
-	releaseData := protocol.ReleaseSeatsData{
-		BookingID: booking.ID,
-		Segments:  make([]protocol.SegmentInfo, 0, len(booking.Itinerary.Segments)),
-	}
-
-	for _, seg := range booking.Itinerary.Segments {
-		releaseData.Segments = append(releaseData.Segments, protocol.SegmentInfo{
-			RideID:    seg.RideID,
-			CompanyID: seg.CompanyID,
-			From:      seg.From,
-			To:        seg.To,
-		})
-	}
-
-	if err := s.clusterManager.ReleaseREST(companyID, releaseData); err != nil {
+	if err != nil {
 		return err
 	}
 
-	return s.reqManager.Submit(func() error {
-		s.repo.CompleteRelease(booking.ID, companyID)
-		s.saveState()
-		return nil
-	})
+	return nil
 }
 
-// decisaoDoCoordenador consulta a decisão de uma transação. Se o próprio nó é o
-// coordenador, lê o registro local, sem chamada de rede.
+// decisaoDoCoordenador consulta a decisão de uma transação. Se o próprio nó é o coordenador,
+// lê o registro local, sem chamada de rede.
 func (s *Server) decisaoDoCoordenador(txID, coordID string) (string, error) {
 	if coordID == "" {
 		return "", fmt.Errorf("coordenador da transação não registrado")
@@ -177,27 +170,23 @@ func (s *Server) decisaoDoCoordenador(txID, coordID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
 	return decisao, nil
 }
 
 // aplicarDecisao efetiva COMMIT ou ABORT de uma transação pendente deste nó,
-// dentro do Single Worker. Chamadas repetidas são seguras no TxLog.
+// dentro do Single Worker. Chamadas repetidas são seguras.
 func (s *Server) aplicarDecisao(txID, decisao string) {
 	var liberadas int
-
 	if err := s.reqManager.Submit(func() error {
 		if decisao == domain.DecisionCommit {
 			s.txLog.Commit(txID)
 		} else {
 			liberadas = s.txLog.Abort(s.repo, txID)
 		}
-
 		s.saveState()
 		return nil
 	}); err != nil {
-		fmt.Printf("[RECOVERY %s] Falha ao aplicar %s na transação %s: %v\n",
-			s.id, decisao, txID, err)
+		fmt.Printf("[RECOVERY %s] Falha ao aplicar %s na transação %s: %v\n", s.id, decisao, txID, err)
 		return
 	}
 
