@@ -13,7 +13,7 @@ Sistema distribuído de reservas de caronas onde **três empresas independentes*
 2. [Pré-requisitos](#pré-requisitos)
 3. [Opção A — Rodando Localmente (Go direto)](#opção-a--rodando-localmente-go-direto)
 4. [Opção B — Rodando com Docker Compose (mesma máquina)](#opção-b--rodando-com-docker-compose-mesma-máquina)
-5. [Opção C — Rodando em Máquinas Distintas do Laboratório](#opção-c--rodando-em-máquinas-distintas-do-laboratório)
+5. [Opção C — Rodando em Máquinas Distintas do Laboratório](#opção-c--rodando-em-máquinas-distintas)
 6. [Usando o Cliente Motorista](#usando-o-cliente-motorista)
 7. [Usando o Cliente Passageiro](#usando-o-cliente-passageiro)
 8. [Simulador de Carga](#simulador-de-carga)
