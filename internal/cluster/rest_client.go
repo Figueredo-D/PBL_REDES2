@@ -7,14 +7,16 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/Figueredo-D/PBL_REDES/internal/domain"
 	"github.com/Figueredo-D/PBL_REDES/internal/protocol"
 )
 
-// httpPeerBases mapeia o ID de cada nó para a base da sua API REST interna.
-// Estes endereços serão trocados por variáveis de ambiente na etapa do Docker.
+// httpPeerBases mapeia o ID de cada nó para a base da sua API REST interna padrão.
+// Estes endereços funcionam como fallback quando não forem fornecidos via flag ou variáveis de ambiente.
 var httpPeerBases = map[string]string{
 	"SERVER_A": "http://localhost:9080",
 	"SERVER_B": "http://localhost:9081",
@@ -37,11 +39,66 @@ type internalDecisionResponse struct {
 	CoordinatorID string `json:"coordinator_id"`
 }
 
+// normalizeBaseURL garante que o endereço do nó tenha prefixo http:// ou https:// e remove barras finais.
+func normalizeBaseURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimRight(raw, "/")
+	if raw == "" {
+		return ""
+	}
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		return "http://" + raw
+	}
+	return raw
+}
+
+// GetPeerBase descobre a URL base da API REST interna de um nó parceiro do consórcio.
+// Ordem de precedência:
+// 1. Configuração explícita passada no mapa cm.Peers
+// 2. Variáveis de ambiente específicas (ex: PEER_SERVER_A_URL, SERVER_A_URL, PEER_A_URL)
+// 3. Fallback do mapa estático padrão (localhost)
+func (cm *ClusterManager) GetPeerBase(peerID string) (string, error) {
+	if cm != nil && cm.Peers != nil {
+		if raw, ok := cm.Peers[peerID]; ok && strings.TrimSpace(raw) != "" {
+			return normalizeBaseURL(raw), nil
+		}
+	}
+
+	envKeys := []string{
+		fmt.Sprintf("PEER_%s_URL", peerID),
+		fmt.Sprintf("%s_URL", peerID),
+	}
+	if strings.HasPrefix(peerID, "SERVER_") {
+		short := strings.TrimPrefix(peerID, "SERVER_")
+		envKeys = append(envKeys, fmt.Sprintf("PEER_%s_URL", short), fmt.Sprintf("%s_URL", short))
+	}
+
+	for _, k := range envKeys {
+		if val := strings.TrimSpace(os.Getenv(k)); val != "" {
+			return normalizeBaseURL(val), nil
+		}
+	}
+
+	if base, ok := httpPeerBases[peerID]; ok && base != "" {
+		return normalizeBaseURL(base), nil
+	}
+
+	return "", fmt.Errorf("peer %s sem endereço REST configurado (defina via flag ou variável PEER_%s_URL)", peerID, peerID)
+}
+
+// SetPeerBase atualiza programaticamente a URL base de um peer no cluster manager.
+func (cm *ClusterManager) SetPeerBase(peerID, baseURL string) {
+	if cm.Peers == nil {
+		cm.Peers = make(map[string]string)
+	}
+	cm.Peers[peerID] = normalizeBaseURL(baseURL)
+}
+
 // ListRidesByDateREST consulta GET /internal/rides no peer informado e devolve as caronas da data.
 func (cm *ClusterManager) ListRidesByDateREST(peerID, date string) ([]*domain.Ride, error) {
-	base, ok := httpPeerBases[peerID]
-	if !ok {
-		return nil, fmt.Errorf("peer %s sem endereço REST configurado", peerID)
+	base, err := cm.GetPeerBase(peerID)
+	if err != nil {
+		return nil, fmt.Errorf("peer %s sem endereço REST: %w", peerID, err)
 	}
 
 	endpoint := base + "/internal/rides?date=" + url.QueryEscape(date)
@@ -72,9 +129,9 @@ func (cm *ClusterManager) ListRidesByDateREST(peerID, date string) ([]*domain.Ri
 
 // postJSON envia um POST com corpo JSON para o peer e devolve o status HTTP e o envelope de resposta.
 func (cm *ClusterManager) postJSON(peerID, path string, payload interface{}) (int, protocol.Response, error) {
-	base, ok := httpPeerBases[peerID]
-	if !ok {
-		return 0, protocol.Response{}, fmt.Errorf("peer %s sem endereço REST configurado", peerID)
+	base, err := cm.GetPeerBase(peerID)
+	if err != nil {
+		return 0, protocol.Response{}, fmt.Errorf("peer %s sem endereço REST: %w", peerID, err)
 	}
 
 	body, err := json.Marshal(payload)
@@ -160,9 +217,9 @@ func (cm *ClusterManager) ReleaseREST(peerID string, data protocol.ReleaseSeatsD
 // Devolve COMMIT, ABORT, IN_PROGRESS ou UNKNOWN. Se o coordenador não responder, devolve erro,
 // e o participante deve manter a transação pendente e tentar novamente mais tarde.
 func (cm *ClusterManager) DecisionREST(coordinatorID, transactionID string) (string, error) {
-	base, ok := httpPeerBases[coordinatorID]
-	if !ok {
-		return "", fmt.Errorf("coordenador %s sem endereço REST configurado", coordinatorID)
+	base, err := cm.GetPeerBase(coordinatorID)
+	if err != nil {
+		return "", fmt.Errorf("coordenador %s sem endereço REST: %w", coordinatorID, err)
 	}
 
 	endpoint := base + "/internal/transactions/decision?transaction_id=" + url.QueryEscape(transactionID)

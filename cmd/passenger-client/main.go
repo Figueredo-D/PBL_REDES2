@@ -92,6 +92,18 @@ func (c *Client) Close() {
 	}
 }
 
+// resolveServerAddr normaliza o endereço de host:porta, adicionando porta 8080 se omitida.
+func resolveServerAddr(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	if !strings.Contains(addr, ":") {
+		return addr + ":8080"
+	}
+	return addr
+}
+
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 
@@ -106,28 +118,49 @@ func main() {
 		passengerToken = "passageiro_default"
 	}
 
-	// Menu interativo para escolha do servidor
-	fmt.Println("\n----------------------------------------------------------------")
-	fmt.Println("                 SELECIONE O NÓ DO CONSÓRCIO                    ")
-	fmt.Println("----------------------------------------------------------------")
-	fmt.Println("  [1] Servidor A  (Porta 8080)")
-	fmt.Println("  [2] Servidor B  (Porta 8081)")
-	fmt.Println("  [3] Servidor C  (Porta 8082)")
-	fmt.Print(" Escolha o servidor (1-3): ")
-
-	scanner.Scan()
-	nodeChoice := strings.TrimSpace(scanner.Text())
-
 	var serverAddr string
-	switch nodeChoice {
-	case "2":
-		serverAddr = "localhost:8081"
-	case "3":
-		serverAddr = "localhost:8082"
-	case "1":
-		fallthrough
-	default:
-		serverAddr = "localhost:8080"
+
+	// 1. Tenta obter endereço via argumento posicional ou variáveis de ambiente (ideal para Docker e scripts)
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		serverAddr = resolveServerAddr(os.Args[1])
+	} else if env := strings.TrimSpace(os.Getenv("SERVER_HOST")); env != "" {
+		serverAddr = resolveServerAddr(env)
+	} else if env := strings.TrimSpace(os.Getenv("SERVER_ADDR")); env != "" {
+		serverAddr = resolveServerAddr(env)
+	}
+
+	// 2. Caso não tenha sido informado previamente, exibe o menu interativo
+	if serverAddr == "" {
+		fmt.Println("\n----------------------------------------------------------------")
+		fmt.Println("                 SELECIONE O NÓ DO CONSÓRCIO                    ")
+		fmt.Println("----------------------------------------------------------------")
+		fmt.Println("  [1] Servidor A  (localhost:8080)")
+		fmt.Println("  [2] Servidor B  (localhost:8081)")
+		fmt.Println("  [3] Servidor C  (localhost:8082)")
+		fmt.Println("  [4] Outro endereço (Host:Porta remoto)")
+		fmt.Print(" Escolha o servidor (1-4): ")
+
+		scanner.Scan()
+		nodeChoice := strings.TrimSpace(scanner.Text())
+
+		switch nodeChoice {
+		case "2":
+			serverAddr = "localhost:8081"
+		case "3":
+			serverAddr = "localhost:8082"
+		case "4":
+			fmt.Print(" Digite o endereço do servidor (ex: 192.168.1.100:8080): ")
+			scanner.Scan()
+			customAddr := strings.TrimSpace(scanner.Text())
+			serverAddr = resolveServerAddr(customAddr)
+			if serverAddr == "" {
+				serverAddr = "localhost:8080"
+			}
+		case "1":
+			fallthrough
+		default:
+			serverAddr = "localhost:8080"
+		}
 	}
 
 	client, err := NewClient(serverAddr)
