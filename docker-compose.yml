@@ -64,6 +64,44 @@ services:
       - consorcio-net
     restart: unless-stopped
 
+  driver_client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: driver-client
+    container_name: driver_client
+    stdin_open: true
+    tty: true
+    environment:
+      - SERVER_A_ADDR=server_a:8080
+      - SERVER_B_ADDR=server_b:8081
+      - SERVER_C_ADDR=server_c:8082
+    depends_on:
+      - server_a
+      - server_b
+      - server_c
+    networks:
+      - consorcio-net
+
+  passenger_client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: passenger-client
+    container_name: passenger_client
+    stdin_open: true
+    tty: true
+    environment:
+      - SERVER_A_ADDR=server_a:8080
+      - SERVER_B_ADDR=server_b:8081
+      - SERVER_C_ADDR=server_c:8082
+    depends_on:
+      - server_a
+      - server_b
+      - server_c
+    networks:
+      - consorcio-net
+
 networks:
   consorcio-net:
     driver: bridge

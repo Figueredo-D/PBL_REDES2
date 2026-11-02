@@ -9,9 +9,22 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Figueredo-D/PBL_REDES/internal/domain"
 	"github.com/Figueredo-D/PBL_REDES/internal/protocol"
+)
+
+const (
+	colorReset  = "\033[0m"
+	colorBold   = "\033[1m"
+	colorDim    = "\033[2m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorBlue   = "\033[34m"
+	colorCyan   = "\033[36m"
+	colorWhite  = "\033[97m"
 )
 
 type Client struct {
@@ -31,7 +44,7 @@ func NewClient(address string) (*Client, error) {
 // connect abre uma nova conexão TCP com o nó escolhido, fechando a anterior se existir.
 func (c *Client) connect() error {
 	if c.conn != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 	}
 	conn, err := net.DialTimeout("tcp", c.address, 3*time.Second)
 	if err != nil {
@@ -44,7 +57,7 @@ func (c *Client) connect() error {
 
 // roundTrip envia a requisição e lê a resposta na conexão atual.
 func (c *Client) roundTrip(reqBytes []byte) (*protocol.Response, error) {
-	c.conn.SetDeadline(time.Now().Add(15 * time.Second))
+	_ = c.conn.SetDeadline(time.Now().Add(15 * time.Second))
 
 	if _, err := c.conn.Write(reqBytes); err != nil {
 		return nil, err
@@ -88,7 +101,7 @@ func (c *Client) Send(action, token string, payload interface{}) (*protocol.Resp
 
 func (c *Client) Close() {
 	if c.conn != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 	}
 }
 
@@ -104,85 +117,171 @@ func resolveServerAddr(addr string) string {
 	return addr
 }
 
+// defaultNodeAddr retorna o endereço configurado para um dos 3 servidores do consórcio
+// (suportando tanto execução em container Docker quanto execução direta no host).
+func defaultNodeAddr(envKey, localFallback string) string {
+	if val := strings.TrimSpace(os.Getenv(envKey)); val != "" {
+		return resolveServerAddr(val)
+	}
+	return localFallback
+}
+
+// selectAndConnect apresenta o seletor de servidor e estabelece a conexão TCP.
+func selectAndConnect(scanner *bufio.Scanner, initialAddr string) (*Client, string, string) {
+	addrA := defaultNodeAddr("SERVER_A_ADDR", "localhost:8080")
+	addrB := defaultNodeAddr("SERVER_B_ADDR", "localhost:8081")
+	addrC := defaultNodeAddr("SERVER_C_ADDR", "localhost:8082")
+
+	serverAddr := initialAddr
+	nodeLabel := "Personalizado"
+
+	for {
+		if serverAddr == "" {
+			fmt.Println()
+			fmt.Printf("%s+==============================================================================+%s\n", colorCyan, colorReset)
+			fmt.Printf("%s|%s                 %sSELECIONE O SERVIDOR DO CONSORCIO (EMPRESA)%s                  %s|%s\n", colorCyan, colorReset, colorBold, colorReset, colorCyan, colorReset)
+			fmt.Printf("%s+------------------------------------------------------------------------------+%s\n", colorCyan, colorReset)
+			fmt.Printf("%s|%s   %s[1]%s  Empresa A  -  Servidor A   %s(%-22s)%s                   %s|%s\n", colorCyan, colorReset, colorBold+colorGreen, colorReset, colorDim, addrA, colorReset, colorCyan, colorReset)
+			fmt.Printf("%s|%s   %s[2]%s  Empresa B  -  Servidor B   %s(%-22s)%s                   %s|%s\n", colorCyan, colorReset, colorBold+colorBlue, colorReset, colorDim, addrB, colorReset, colorCyan, colorReset)
+			fmt.Printf("%s|%s   %s[3]%s  Empresa C  -  Servidor C   %s(%-22s)%s                   %s|%s\n", colorCyan, colorReset, colorBold+colorYellow, colorReset, colorDim, addrC, colorReset, colorCyan, colorReset)
+			fmt.Printf("%s|%s   %s[4]%s  Outro endereco (Host:Porta remoto)                                    %s|%s\n", colorCyan, colorReset, colorBold, colorReset, colorCyan, colorReset)
+			fmt.Printf("%s+==============================================================================+%s\n", colorCyan, colorReset)
+			fmt.Printf(" %s>%s Escolha o servidor (1-4) [padrao: 1]: ", colorCyan+colorBold, colorReset)
+
+			if !scanner.Scan() {
+				os.Exit(0)
+			}
+			nodeChoice := strings.TrimSpace(scanner.Text())
+
+			switch nodeChoice {
+			case "2":
+				serverAddr = addrB
+				nodeLabel = "SERVER_B"
+			case "3":
+				serverAddr = addrC
+				nodeLabel = "SERVER_C"
+			case "4":
+				fmt.Printf(" %s>%s Digite o endereco do servidor (ex: 192.168.1.10:8080): ", colorCyan+colorBold, colorReset)
+				if !scanner.Scan() {
+					os.Exit(0)
+				}
+				customAddr := resolveServerAddr(scanner.Text())
+				if customAddr == "" {
+					serverAddr = addrA
+					nodeLabel = "SERVER_A"
+				} else {
+					serverAddr = customAddr
+					nodeLabel = "REMOTO"
+				}
+			case "1", "":
+				serverAddr = addrA
+				nodeLabel = "SERVER_A"
+			default:
+				fmt.Printf("\n %s[!] Opcao invalida. Selecionando Servidor A por padrao.%s\n", colorYellow, colorReset)
+				serverAddr = addrA
+				nodeLabel = "SERVER_A"
+			}
+		} else {
+			switch serverAddr {
+			case addrA, "localhost:8080":
+				nodeLabel = "SERVER_A"
+			case addrB, "localhost:8081":
+				nodeLabel = "SERVER_B"
+			case addrC, "localhost:8082":
+				nodeLabel = "SERVER_C"
+			default:
+				nodeLabel = "REMOTO"
+			}
+		}
+
+		client, err := NewClient(serverAddr)
+		if err == nil {
+			return client, serverAddr, nodeLabel
+		}
+
+		fmt.Printf("\n %s[ERRO DE CONEXAO]%s Nao foi possivel conectar em %s(%s)%s: %v\n",
+			colorRed+colorBold, colorReset, colorBold, serverAddr, colorReset, err)
+		serverAddr = ""
+	}
+}
+
+func printWelcomeBanner() {
+	fmt.Println()
+	fmt.Printf("%s+==============================================================================+%s\n", colorCyan, colorReset)
+	fmt.Printf("%s|%s              %sVAIJUNTO - CONSORCIO DE CARONAS COMPARTILHADAS%s                  %s|%s\n", colorCyan, colorReset, colorBold+colorWhite, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s|%s                      %sPORTAL INTERATIVO DO MOTORISTA%s                          %s|%s\n", colorCyan, colorReset, colorCyan+colorBold, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s+==============================================================================+%s\n", colorCyan, colorReset)
+}
+
+func promptDriverToken(scanner *bufio.Scanner, current string) string {
+	if current != "" {
+		fmt.Printf("\n %s>%s Digite o novo Token de Motorista (Enter para manter [%s]): ", colorCyan+colorBold, colorReset, current)
+	} else {
+		fmt.Printf("\n %s>%s Digite seu Token/Identificador de Motorista: ", colorCyan+colorBold, colorReset)
+	}
+	if !scanner.Scan() {
+		os.Exit(0)
+	}
+	token := strings.TrimSpace(scanner.Text())
+	if token == "" {
+		if current != "" {
+			return current
+		}
+		return "motorista_default"
+	}
+	return token
+}
+
+func printMainMenu(driverToken, nodeLabel, serverAddr string) {
+	statusLine := fmt.Sprintf(" Motorista: [%s]   |   Empresa: [%s (%s)]", driverToken, nodeLabel, serverAddr)
+	fmt.Println()
+	fmt.Printf("%s+==============================================================================+%s\n", colorCyan, colorReset)
+	fmt.Printf("%s|%s  %sPAINEL DO MOTORISTA%s                                                         %s|%s\n", colorCyan, colorReset, colorBold+colorWhite, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s|%s  %s%-74s%s  %s|%s\n", colorCyan, colorReset, colorDim, padRight(statusLine, 74), colorReset, colorCyan, colorReset)
+	fmt.Printf("%s+------------------------------------------------------------------------------+%s\n", colorCyan, colorReset)
+	fmt.Printf("%s|%s                                                                              %s|%s\n", colorCyan, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s|%s    %s[1]%s  Ofertar Nova Carona                                                  %s|%s\n", colorCyan, colorReset, colorBold+colorGreen, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s|%s    %s[2]%s  Minhas Caronas Cadastradas                                           %s|%s\n", colorCyan, colorReset, colorBold+colorCyan, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s|%s    %s[3]%s  Cancelar uma Carona                                                  %s|%s\n", colorCyan, colorReset, colorBold+colorYellow, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s|%s    %s[4]%s  Trocar de Servidor / Trocar Usuario                                  %s|%s\n", colorCyan, colorReset, colorBold+colorBlue, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s|%s    %s[0]%s  Encerrar Sessao                                                      %s|%s\n", colorCyan, colorReset, colorBold+colorRed, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s|%s                                                                              %s|%s\n", colorCyan, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s+==============================================================================+%s\n", colorCyan, colorReset)
+	fmt.Printf(" %s>%s Escolha uma opcao (0-4): ", colorCyan+colorBold, colorReset)
+}
+
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 
-	fmt.Println("================================================================")
-	fmt.Println("            SISTEMA DE CARONAS DISTRIBUÍDO - MOTORISTA          ")
-	fmt.Println("================================================================")
+	printWelcomeBanner()
+	driverToken := promptDriverToken(scanner, "")
 
-	fmt.Print(" Digite seu Token de Motorista: ")
-	scanner.Scan()
-	driverToken := strings.TrimSpace(scanner.Text())
-	if driverToken == "" {
-		driverToken = "driver_default"
-	}
-
-	var serverAddr string
-
-	// 1. Tenta obter endereço via argumento posicional ou variáveis de ambiente (ideal para Docker e scripts)
+	var initialAddr string
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
-		serverAddr = resolveServerAddr(os.Args[1])
+		initialAddr = resolveServerAddr(os.Args[1])
 	} else if env := strings.TrimSpace(os.Getenv("SERVER_HOST")); env != "" {
-		serverAddr = resolveServerAddr(env)
+		initialAddr = resolveServerAddr(env)
 	} else if env := strings.TrimSpace(os.Getenv("SERVER_ADDR")); env != "" {
-		serverAddr = resolveServerAddr(env)
+		initialAddr = resolveServerAddr(env)
 	}
 
-	// 2. Caso não tenha sido informado previamente, exibe o menu interativo
-	if serverAddr == "" {
-		fmt.Println("\n----------------------------------------------------------------")
-		fmt.Println("                 SELECIONE O NÓ DO CONSÓRCIO                    ")
-		fmt.Println("----------------------------------------------------------------")
-		fmt.Println("  [1] Servidor A  (localhost:8080)")
-		fmt.Println("  [2] Servidor B  (localhost:8081)")
-		fmt.Println("  [3] Servidor C  (localhost:8082)")
-		fmt.Println("  [4] Outro endereço (Host:Porta remoto)")
-		fmt.Print(" Escolha o servidor (1-4): ")
-
-		scanner.Scan()
-		nodeChoice := strings.TrimSpace(scanner.Text())
-
-		switch nodeChoice {
-		case "2":
-			serverAddr = "localhost:8081"
-		case "3":
-			serverAddr = "localhost:8082"
-		case "4":
-			fmt.Print(" Digite o endereço do servidor (ex: 192.168.1.100:8080): ")
-			scanner.Scan()
-			customAddr := strings.TrimSpace(scanner.Text())
-			serverAddr = resolveServerAddr(customAddr)
-			if serverAddr == "" {
-				serverAddr = "localhost:8080"
-			}
-		case "1":
-			fallthrough
-		default:
-			serverAddr = "localhost:8080"
+	client, serverAddr, nodeLabel := selectAndConnect(scanner, initialAddr)
+	defer func() {
+		if client != nil {
+			client.Close()
 		}
-	}
+	}()
 
-	client, err := NewClient(serverAddr)
-	if err != nil {
-		fmt.Printf("\n[ ERRO DE CONEXÃO] Não foi possível conectar ao nó em (%s): %v\n", serverAddr, err)
-		os.Exit(1)
-	}
-	defer client.Close()
-
-	fmt.Printf("[ CONECTADO] Motorista [%s] conectado com sucesso ao nó: %s\n", driverToken, serverAddr)
+	fmt.Printf("\n %s[CONECTADO]%s Motorista %s[%s]%s autenticado em %s%s (%s)%s\n",
+		colorGreen+colorBold, colorReset, colorBold, driverToken, colorReset, colorCyan+colorBold, nodeLabel, serverAddr, colorReset)
 
 	for {
-		fmt.Println("\n----------------------------------------------------------------")
-		fmt.Printf("   PAINEL DO MOTORISTA  |  Usuário: [%s]  |  Nó: [%s]\n", driverToken, serverAddr)
-		fmt.Println("----------------------------------------------------------------")
-		fmt.Println("  [1]  Ofertar Nova Carona")
-		fmt.Println("  [2]  Minhas Caronas Cadastradas")
-		fmt.Println("  [3]  Cancelar uma Carona")
-		fmt.Println("  [0]  Sair")
-		fmt.Print(" Escolha uma opção: ")
+		printMainMenu(driverToken, nodeLabel, serverAddr)
 
-		scanner.Scan()
+		if !scanner.Scan() {
+			fmt.Println("\n Encerrando sessao do motorista...")
+			return
+		}
 		option := strings.TrimSpace(scanner.Text())
 
 		switch option {
@@ -192,22 +291,32 @@ func main() {
 			handleListRides(client, driverToken)
 		case "3":
 			handleCancelRide(client, scanner, driverToken)
+		case "4":
+			driverToken = promptDriverToken(scanner, driverToken)
+			client.Close()
+			client, serverAddr, nodeLabel = selectAndConnect(scanner, "")
+			fmt.Printf("\n %s[CONECTADO]%s Motorista %s[%s]%s conectado a %s%s (%s)%s\n",
+				colorGreen+colorBold, colorReset, colorBold, driverToken, colorReset, colorCyan+colorBold, nodeLabel, serverAddr, colorReset)
 		case "0":
-			fmt.Println("\n A encerrar sessão do motorista...")
+			fmt.Printf("\n %sSessao do motorista encerrada com seguranca. Ate logo!%s\n\n", colorCyan+colorBold, colorReset)
 			return
 		default:
-			fmt.Println("\n[!] Opção inválida. Tente novamente.")
+			fmt.Printf("\n %s[!] Opcao invalida. Digite um numero entre 0 e 4.%s\n", colorYellow, colorReset)
 		}
 	}
 }
 
 func handleOfferRide(client *Client, scanner *bufio.Scanner, token string) {
-	fmt.Println("\n================================================================")
-	fmt.Println("                   CADASTRAR NOVA CARONA                        ")
-	fmt.Println("================================================================")
+	fmt.Println()
+	fmt.Printf("%s+------------------------------------------------------------------------------+%s\n", colorGreen, colorReset)
+	fmt.Printf("%s|%s                       %sCADASTRAR NOVA OFERTA DE CARONA%s                        %s|%s\n", colorGreen, colorReset, colorBold+colorWhite, colorReset, colorGreen, colorReset)
+	fmt.Printf("%s+------------------------------------------------------------------------------+%s\n", colorGreen, colorReset)
 
-	fmt.Print(" Cidades da rota (separadas por vírgula, ex: Feira, Salvador): ")
-	scanner.Scan()
+	fmt.Printf(" %s[1/4]%s Cidades da rota (separadas por virgula, ex: Salvador, Feira, Conquista):\n", colorCyan+colorBold, colorReset)
+	fmt.Printf("       %s>%s ", colorCyan+colorBold, colorReset)
+	if !scanner.Scan() {
+		return
+	}
 	rawCities := strings.Split(scanner.Text(), ",")
 	var route []string
 	for _, c := range rawCities {
@@ -218,36 +327,45 @@ func handleOfferRide(client *Client, scanner *bufio.Scanner, token string) {
 	}
 
 	if len(route) < 2 {
-		fmt.Println("[ ERRO] A rota deve conter pelo menos 2 cidades (Origem e Destino).")
+		fmt.Printf("\n %s[ERRO]%s A rota deve conter pelo menos 2 cidades (Origem e Destino).\n", colorRed+colorBold, colorReset)
 		return
 	}
 
-	fmt.Print(" Data da viagem (AAAA-MM-DD): ")
-	scanner.Scan()
+	fmt.Printf(" %s[2/4]%s Data da viagem (formato AAAA-MM-DD, ex: 2026-12-15): ", colorCyan+colorBold, colorReset)
+	if !scanner.Scan() {
+		return
+	}
 	date := strings.TrimSpace(scanner.Text())
 
-	fmt.Print(" Horário de Saída (HH:MM): ")
-	scanner.Scan()
+	fmt.Printf(" %s[3/4]%s Horario de partida (formato HH:MM, ex: 08:00): ", colorCyan+colorBold, colorReset)
+	if !scanner.Scan() {
+		return
+	}
 	timeStr := strings.TrimSpace(scanner.Text())
 
-	fmt.Print("💺 Quantidade total de assentos disponíveis: ")
-	scanner.Scan()
+	fmt.Printf(" %s[4/4]%s Quantidade de assentos disponiveis no veiculo: ", colorCyan+colorBold, colorReset)
+	if !scanner.Scan() {
+		return
+	}
 	seats, err := strconv.Atoi(strings.TrimSpace(scanner.Text()))
 	if err != nil || seats <= 0 {
-		fmt.Println("[ ERRO] Quantidade de assentos inválida.")
+		fmt.Printf("\n %s[ERRO]%s Quantidade de assentos invalida (deve ser maior que zero).\n", colorRed+colorBold, colorReset)
 		return
 	}
 
 	numSegments := len(route) - 1
 	var prices []float64
-	fmt.Printf("\n Informe o preço individual para cada um dos %d trechos:\n", numSegments)
+	fmt.Printf("\n %sInforme o valor individual para cada um dos %d trecho(s):%s\n", colorBold, numSegments, colorReset)
 
 	for i := 0; i < numSegments; i++ {
-		fmt.Printf("   Trecho [%s ➔ %s] (R$): ", route[i], route[i+1])
-		scanner.Scan()
-		price, err := strconv.ParseFloat(strings.TrimSpace(scanner.Text()), 64)
+		fmt.Printf("    - Trecho #%d  %s%-18s -> %-18s%s (R$): ", i+1, colorCyan, route[i], route[i+1], colorReset)
+		if !scanner.Scan() {
+			return
+		}
+		priceStr := strings.ReplaceAll(strings.TrimSpace(scanner.Text()), ",", ".")
+		price, err := strconv.ParseFloat(priceStr, 64)
 		if err != nil || price <= 0 {
-			fmt.Println("[ ERRO] Preço inválido. Operação cancelada.")
+			fmt.Printf("\n %s[ERRO]%s Preco invalido. Operacao cancelada.\n", colorRed+colorBold, colorReset)
 			return
 		}
 		prices = append(prices, price)
@@ -263,83 +381,131 @@ func handleOfferRide(client *Client, scanner *bufio.Scanner, token string) {
 
 	resp, err := client.Send(protocol.ActionOfferRide, token, offerPayload)
 	if err != nil {
-		fmt.Printf("[ ERRO TCP]: %v\n", err)
+		fmt.Printf("\n %s[ERRO DE COMUNICACAO]%s %v\n", colorRed+colorBold, colorReset, err)
 		return
 	}
 
 	if resp.Status == "SUCCESS" {
-		fmt.Printf("\n[ SUCESSO] %s\n", resp.Message)
+		fmt.Printf("\n %s[OK - CARONA PUBLICADA]%s %s\n", colorGreen+colorBold, colorReset, resp.Message)
 	} else {
-		fmt.Printf("\n[ FALHA] [%s] %s\n", resp.Code, resp.Message)
+		fmt.Printf("\n %s[FALHA]%s [%s] %s\n", colorRed+colorBold, colorReset, resp.Code, resp.Message)
 	}
 }
 
-func handleListRides(client *Client, token string) {
+func handleListRides(client *Client, token string) []*domain.Ride {
 	resp, err := client.Send(protocol.ActionListRides, token, nil)
 	if err != nil {
-		fmt.Printf("\n[ ERRO] Não foi possível consultar as suas caronas cadastradas: %v\n", err)
-		return
+		fmt.Printf("\n %s[ERRO]%s Nao foi possivel consultar suas caronas: %v\n", colorRed+colorBold, colorReset, err)
+		return nil
 	}
 	if resp.Status != "SUCCESS" {
-		fmt.Println("\n[ ERRO] Não foi possível consultar as suas caronas cadastradas.")
-		return
+		fmt.Printf("\n %s[ERRO]%s %s\n", colorRed+colorBold, colorReset, resp.Message)
+		return nil
 	}
 
 	var rides []*domain.Ride
-	json.Unmarshal([]byte(resp.Data), &rides)
+	_ = json.Unmarshal([]byte(resp.Data), &rides)
+
+	fmt.Println()
+	fmt.Printf("%s+==============================================================================+%s\n", colorCyan, colorReset)
+	fmt.Printf("%s|%s                        %sMINHAS CARONAS CADASTRADAS%s                            %s|%s\n", colorCyan, colorReset, colorBold+colorWhite, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s+==============================================================================+%s\n", colorCyan, colorReset)
 
 	if len(rides) == 0 {
-		fmt.Println("\n Nenhuma carona cadastrada no seu perfil neste nó.")
-		return
+		fmt.Printf("\n   %sNenhuma carona ativa cadastrada para o motorista [%s] neste servidor.%s\n", colorYellow, token, colorReset)
+		return nil
 	}
 
-	fmt.Println("\n==========================================================================================")
-	fmt.Println("                               MINHAS CARONAS OFERTADAS                                   ")
-	fmt.Println("==========================================================================================")
-	for _, ride := range rides {
-		fmt.Printf("\n  ID DA CARONA: %s  |   Data: %s  |   Saída: %s hrs  |   Vagas Totais: %d\n",
-			ride.ID, ride.Date, ride.Time, ride.TotalSeats)
+	for idx, ride := range rides {
+		routeSummary := strings.Join(ride.Route, " -> ")
+		fmt.Println()
+		fmt.Printf(" %s+----------------------------------------------------------------------------+%s\n", colorCyan, colorReset)
+		fmt.Printf(" %s|%s %sCARONA #%d%s  |  ID: %s%-20s%s  |  Data: %s%s%s  |  Saida: %s%sh%s\n",
+			colorCyan, colorReset,
+			colorBold+colorWhite, idx+1, colorReset,
+			colorGreen+colorBold, ride.ID, colorReset,
+			colorBold, ride.Date, colorReset,
+			colorBold, ride.Time, colorReset)
+		fmt.Printf(" %s|%s Rota Completa: %s%s%s  (Capacidade: %d assentos)\n",
+			colorCyan, colorReset, colorCyan+colorBold, routeSummary, colorReset, ride.TotalSeats)
+		fmt.Printf(" %s+----+------------------------+------------------------+------------+--------+%s\n", colorCyan, colorReset)
+		fmt.Printf(" %s|%s %s# %s %s|%s %sORIGEM                %s %s|%s %sDESTINO               %s %s|%s %sPRECO     %s %s|%s %sVAGAS %s %s|%s\n",
+			colorCyan, colorReset, colorBold, colorReset,
+			colorCyan, colorReset, colorBold, colorReset,
+			colorCyan, colorReset, colorBold, colorReset,
+			colorCyan, colorReset, colorBold, colorReset,
+			colorCyan, colorReset, colorBold, colorReset,
+			colorCyan, colorReset)
+		fmt.Printf(" %s+----+------------------------+------------------------+------------+--------+%s\n", colorCyan, colorReset)
 
-		fmt.Println("  +----+------------------------+------------------------+----------+-------------------+")
-		fmt.Println("  | #  | ORIGEM                 | DESTINO                | PREÇO    | VAGAS DISPONÍVEIS |")
-		fmt.Println("  +----+------------------------+------------------------+----------+-------------------+")
 		for j, seg := range ride.Segments {
-			fmt.Printf("  | %-2d | %-22s | %-22s | R$%-6.2f | %-17d |\n",
-				j+1, truncate(seg.From, 22), truncate(seg.To, 22), seg.Price, seg.AvailableSeats)
+			seatColor := colorGreen
+			if seg.AvailableSeats == 0 {
+				seatColor = colorRed
+			} else if seg.AvailableSeats == 1 {
+				seatColor = colorYellow
+			}
+			vagasStr := fmt.Sprintf("%d/%d", seg.AvailableSeats, ride.TotalSeats)
+			precoStr := fmt.Sprintf("R$ %6.2f", seg.Price)
+
+			fmt.Printf(" %s|%s %-2d %s|%s %-22s %s|%s %-22s %s|%s %-10s %s|%s %s%-6s%s %s|%s\n",
+				colorCyan, colorReset, j+1,
+				colorCyan, colorReset, padRight(seg.From, 22),
+				colorCyan, colorReset, padRight(seg.To, 22),
+				colorCyan, colorReset, padRight(precoStr, 10),
+				colorCyan, colorReset, seatColor+colorBold, padRight(vagasStr, 6), colorReset,
+				colorCyan, colorReset)
 		}
-		fmt.Println("  +----+------------------------+------------------------+----------+-------------------+")
+		fmt.Printf(" %s+----+------------------------+------------------------+------------+--------+%s\n", colorCyan, colorReset)
 	}
+	return rides
 }
 
 func handleCancelRide(client *Client, scanner *bufio.Scanner, token string) {
-	handleListRides(client, token)
-
-	fmt.Print("\n Digite o ID exato da Carona que deseja CANCELAR (ex: SERVER_A_RIDE_0001): ")
-	scanner.Scan()
-	rideID := strings.TrimSpace(scanner.Text())
-
-	if rideID == "" {
+	rides := handleListRides(client, token)
+	if len(rides) == 0 {
 		return
+	}
+
+	fmt.Printf("\n %s>%s Digite o %sID da Carona%s (ex: %s) ou o %snumero # da lista%s (1..%d) para cancelar [0 = voltar]: ",
+		colorYellow+colorBold, colorReset, colorBold, colorReset, rides[0].ID, colorBold, colorReset, len(rides))
+	if !scanner.Scan() {
+		return
+	}
+	input := strings.TrimSpace(scanner.Text())
+	if input == "" || input == "0" {
+		fmt.Printf(" %sOperacao de cancelamento abortada.%s\n", colorDim, colorReset)
+		return
+	}
+
+	rideID := input
+	if idx, err := strconv.Atoi(input); err == nil && idx >= 1 && idx <= len(rides) {
+		rideID = rides[idx-1].ID
 	}
 
 	cancelPayload := protocol.CancelRideData{RideID: rideID}
 	resp, err := client.Send(protocol.ActionCancelRide, token, cancelPayload)
-
 	if err != nil {
-		fmt.Printf("\n[ ERRO TCP]: %v\n", err)
+		fmt.Printf("\n %s[ERRO DE COMUNICACAO]%s %v\n", colorRed+colorBold, colorReset, err)
 		return
 	}
 
 	if resp.Status == "SUCCESS" {
-		fmt.Printf("\n[ SUCESSO] %s\n", resp.Message)
+		fmt.Printf("\n %s[OK - CARONA CANCELADA]%s %s (Todas as reservas associadas no consorcio foram notificadas!)\n",
+			colorGreen+colorBold, colorReset, resp.Message)
 	} else {
-		fmt.Printf("\n[ FALHA] [%s] %s\n", resp.Code, resp.Message)
+		fmt.Printf("\n %s[FALHA]%s [%s] %s\n", colorRed+colorBold, colorReset, resp.Code, resp.Message)
 	}
 }
 
-func truncate(str string, max int) string {
-	if len(str) > max {
-		return str[:max-3] + "..."
+func padRight(str string, width int) string {
+	runeLen := utf8.RuneCountInString(str)
+	if runeLen > width {
+		runes := []rune(str)
+		if width > 3 {
+			return string(runes[:width-3]) + "..."
+		}
+		return string(runes[:width])
 	}
-	return str
+	return str + strings.Repeat(" ", width-runeLen)
 }

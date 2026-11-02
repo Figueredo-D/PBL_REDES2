@@ -210,7 +210,7 @@ func main() {
 		logFatal("Oferta C", err)
 	}
 
-	fmt.Println("  ✔ Caronas registradas. Itinerário combinado: Salvador -> Feira -> Conquista -> Montes Claros (A + B + C).")
+	fmt.Println("  [OK] Caronas registradas. Itinerário combinado: Salvador -> Feira -> Conquista -> Montes Claros (A + B + C).")
 
 	// 2. Busca do Itinerário Combinado pelo Coordenador (Servidor A)
 	searchResp, err := cA.Send(protocol.ActionSearchItinerary, "passageiro_teste", protocol.SearchItineraryData{
@@ -227,7 +227,7 @@ func main() {
 		logFatal("Parsing do itinerário combinado", err)
 	}
 	fullItin := itineraries[0]
-	fmt.Printf("  ✔ Itinerário multi-empresa descoberto com %d trechos.\n", len(fullItin.Segments))
+	fmt.Printf("  [OK] Itinerário multi-empresa descoberto com %d trechos.\n", len(fullItin.Segments))
 
 	// 3. Disparo de Reservas Concorrentes e Injeção de Queda no Servidor B
 	fmt.Println("\n[EXECUÇÃO] Disparando reservas simultâneas e INJETANDO QUEDA do Servidor B...")
@@ -263,9 +263,9 @@ func main() {
 		if i == *flagWorkers/2 {
 			go func() {
 				time.Sleep(10 * time.Millisecond)
-				fmt.Println("\n  💥 [INJEÇÃO DE FALHA] CRASH NO SERVIDOR B! Parando porta TCP e API REST interna...")
+				fmt.Println("\n  [INJEÇÃO DE FALHA] CRASH NO SERVIDOR B! Parando porta TCP e API REST interna...")
 				srvB.Stop()
-				fmt.Println("  💥 [INJEÇÃO DE FALHA] Servidor B agora está COMPLETAMENTE INOPERANTE.")
+				fmt.Println("  [INJEÇÃO DE FALHA] Servidor B agora está COMPLETAMENTE INOPERANTE.")
 			}()
 		}
 	}
@@ -282,9 +282,9 @@ func main() {
 		Date:        date,
 	}, 3*time.Second)
 	if err == nil && localResp.Status == "SUCCESS" {
-		fmt.Println("  ✔ PASSOU: Servidor A continua atendendo requisições independentes do nó que falhou!")
+		fmt.Println("  [OK] PASSOU: Servidor A continua atendendo requisições independentes do nó que falhou!")
 	} else {
-		fmt.Println("  ✖ FALHA: Servidor A travou com a queda de B!")
+		fmt.Println("  [ERRO] FALHA: Servidor A travou com a queda de B!")
 	}
 
 	// 5. Recuperação do Servidor B
@@ -297,7 +297,7 @@ func main() {
 	srvBRec.StartRecovery()
 	go func() { _ = srvBRec.Start() }()
 
-	fmt.Println("  ✔ Servidor B reiniciado. Aguardando reconciliação da thread de recovery...")
+	fmt.Println("  [OK] Servidor B reiniciado. Aguardando reconciliação da thread de recovery...")
 	time.Sleep(2 * time.Second) // Aguarda a thread periódica de recuperação rodar
 
 	// 6. VALIDAÇÃO DOS 3 INVARIANTES DO EDITAL
@@ -313,13 +313,13 @@ func main() {
 	seatsB := getAvailableSeats("http://"+restB, date, "Feira", "Conquista")
 	seatsC := getAvailableSeats("http://"+restC, date, "Conquista", "Montes Claros")
 
-	fmt.Printf("   • Vagas restantes: A=%d, B=%d, C=%d (Iniciais: %d)\n", seatsA, seatsB, seatsC, *flagSeats)
+	fmt.Printf("   - Vagas restantes: A=%d, B=%d, C=%d (Iniciais: %d)\n", seatsA, seatsB, seatsC, *flagSeats)
 
 	if seatsA < 0 || seatsB < 0 || seatsC < 0 {
-		fmt.Println("   ✖ FALHA: Detectada quantidade negativa de vagas (OVERBOOKING)!")
+		fmt.Println("   [ERRO] FALHA: Detectada quantidade negativa de vagas (OVERBOOKING)!")
 		allPass = false
 	} else {
-		fmt.Println("   ✔ PASSOU: Nenhum assento foi confirmado para mais de um passageiro!")
+		fmt.Println("   [OK] PASSOU: Nenhum assento foi confirmado para mais de um passageiro!")
 	}
 
 	// Invariante 2: Zero Itinerário pela Metade (Atomicidade 2PC)
@@ -330,15 +330,15 @@ func main() {
 	consumedB := *flagSeats - seatsB
 	consumedC := *flagSeats - seatsC
 
-	fmt.Printf("   • Vagas consumidas pelo itinerário multi-empresa: A=%d, B=%d, C=%d\n",
+	fmt.Printf("   - Vagas consumidas pelo itinerário multi-empresa: A=%d, B=%d, C=%d\n",
 		consumedA, consumedB, consumedC)
 
 	if consumedA != consumedB || consumedB != consumedC {
-		fmt.Printf("   ✖ FALHA DE ATOMICIDADE: Itinerário foi reservado pela metade! (A:%d, B:%d, C:%d)\n",
+		fmt.Printf("   [ERRO] FALHA DE ATOMICIDADE: Itinerário foi reservado pela metade! (A:%d, B:%d, C:%d)\n",
 			consumedA, consumedB, consumedC)
 		allPass = false
 	} else {
-		fmt.Printf("   ✔ PASSOU: Atomicidade 2PC respeitada! Exatamente %d reservas foram confirmadas por completo em todos os nós!\n", consumedA)
+		fmt.Printf("   [OK] PASSOU: Atomicidade 2PC respeitada! Exatamente %d reservas foram confirmadas por completo em todos os nós!\n", consumedA)
 	}
 
 	// Invariante 3: Zero Assentos Bloqueados após Queda e Recuperação
@@ -346,15 +346,15 @@ func main() {
 	txLogBPath := filepath.Join(dataDirB, "txlog.json")
 	txB, err := domain.LoadTxLog(txLogBPath)
 	if err != nil {
-		fmt.Printf("   ✖ Erro ao inspecionar txlog de B: %v\n", err)
+		fmt.Printf("   [ERRO] Erro ao inspecionar txlog de B: %v\n", err)
 		allPass = false
 	} else {
 		pendingB := txB.PendingTransactions()
 		if len(pendingB) > 0 {
-			fmt.Printf("   ✖ FALHA: Servidor B ainda possui %d transações bloqueadas em PREPARED!\n", len(pendingB))
+			fmt.Printf("   [ERRO] FALHA: Servidor B ainda possui %d transações bloqueadas em PREPARED!\n", len(pendingB))
 			allPass = false
 		} else {
-			fmt.Println("   ✔ PASSOU: Todas as transações pendentes foram resolvidas pelo Recovery! Zero assentos bloqueados.")
+			fmt.Println("   [OK] PASSOU: Todas as transações pendentes foram resolvidas pelo Recovery! Zero assentos bloqueados.")
 		}
 	}
 
@@ -365,7 +365,7 @@ func main() {
 
 	fmt.Println("\n----------------------------------------------------------------")
 	if allPass {
-		fmt.Println("RESULTADO FINAL: TODOS OS INVARIANTES DO EDITAL FORAM CONFIRMADOS COM SUCESSO! 🎉")
+		fmt.Println("RESULTADO FINAL: TODOS OS INVARIANTES DO EDITAL FORAM CONFIRMADOS COM SUCESSO!")
 		fmt.Println("================================================================")
 		os.Exit(0)
 	} else {

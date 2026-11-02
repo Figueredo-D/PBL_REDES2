@@ -132,28 +132,38 @@ Cada um deve retornar `[]` (lista vazia) se ainda não há caronas, ou a lista d
 
 Simula o ambiente de laboratório com containers isolados rodando na mesma máquina.
 
-### 1. Construir e subir todos os containers
-
-```bash
-docker compose up --build
-```
-
-Isso vai:
-- Compilar o binário do servidor em Go dentro de um container builder
-- Criar 3 containers: `server_a`, `server_b`, `server_c`
-- Conectá-los na rede interna `consorcio-net`
-- Expor as portas nas mesmas do modo local (8080-8082 TCP, 9080-9082 REST)
-
-### 2. Rodar em segundo plano (opcional)
+### 1. Construir e subir todos os containers (Servidores + Clientes)
 
 ```bash
 docker compose up --build -d
 ```
 
-Para ver os logs:
+Isso vai:
+- Compilar os binários em Go (`server`, `driver-client` e `passenger-client`) dentro de um container builder multi-stage
+- Subir os **3 containers de servidores**: `server_a`, `server_b`, `server_c`
+- Subir os **2 containers de clientes interativos**: `driver_client` (motorista) e `passenger_client` (passageiro)
+- Conectá-los na rede interna `consorcio-net` (com resolução automática de DNS para `server_a:8080`, `server_b:8081` e `server_c:8082`)
+- Expor as portas dos servidores para o host (`8080-8082` TCP, `9080-9082` REST)
+
+### 2. Acessar os clientes interativos em container Docker
+
+Com a infraestrutura no ar, você pode abrir quantos terminais quiser para interagir com os containers de **Motorista** e **Passageiro**:
+
+**Abrir um terminal interativo do Cliente Motorista (via Docker):**
 ```bash
-docker compose logs -f
-docker compose logs -f server_a   # só um nó
+docker compose run --rm driver_client
+```
+*(Ou, para usar o container `driver_client` já em execução: `docker exec -it driver_client ./driver-client`)*
+
+**Abrir um terminal interativo do Cliente Passageiro (via Docker):**
+```bash
+docker compose run --rm passenger_client
+```
+*(Ou, para usar o container `passenger_client` já em execução: `docker exec -it passenger_client ./passenger-client`)*
+
+Para ver os logs dos servidores:
+```bash
+docker compose logs -f server_a server_b server_c
 ```
 
 ### 3. Parar os containers
@@ -284,18 +294,22 @@ curl http://192.168.1.12:9082/internal/rides
 
 ## Usando o Cliente Motorista
 
-O cliente motorista se conecta ao servidor da sua empresa e pode publicar caronas.
+O cliente motorista se conecta ao servidor da sua empresa e pode ofertar, listar e cancelar caronas, além de alternar de servidor ou de usuário diretamente pelo menu.
 
-### Modo interativo (menu)
+### Modo interativo (Docker ou Go local)
 
 ```bash
-# Conectar ao servidor local
+# Via Docker Compose (recomendado)
+docker compose run --rm driver_client
+
+# Ou usando o container já iniciado pelo docker compose up -d
+docker exec -it driver_client ./driver-client
+
+# Via Go local (conectando pelo seletor interativo)
 go run cmd/driver-client/main.go
 
-# Conectar a um servidor específico
+# Conectar diretamente a um servidor específico (local ou remoto)
 go run cmd/driver-client/main.go localhost:8080
-
-# Conectar a um servidor remoto (laboratório)
 go run cmd/driver-client/main.go 192.168.1.10:8080
 ```
 
@@ -307,35 +321,45 @@ SERVER_HOST=192.168.1.10:8080 go run cmd/driver-client/main.go
 ### Fluxo básico no menu
 
 ```
-====================================================
-        CLIENTE MOTORISTA — VaiJunto
-====================================================
-[1] Publicar carona
-[2] Ver minhas caronas
-[3] Encerrar conexão
-[4] Outro endereço (Host:Porta remoto)
-====================================================
++==============================================================================+
+|  PAINEL DO MOTORISTA                                                         |
+|   Motorista: [driver_A]   |   Empresa: [SERVER_A (server_a:8080)]            |
++------------------------------------------------------------------------------+
+|                                                                              |
+|    [1]  Ofertar Nova Carona                                                  |
+|    [2]  Minhas Caronas Cadastradas                                           |
+|    [3]  Cancelar uma Carona                                                  |
+|    [4]  Trocar de Servidor / Trocar Usuario                                  |
+|    [0]  Encerrar Sessao                                                      |
+|                                                                              |
++==============================================================================+
 ```
 
-1. **Publicar carona** → informe rota (ex: `Salvador,Feira`), data (`2025-12-01`), horário (`08:00`), total de assentos e preços por trecho
-2. **Ver minhas caronas** → lista as caronas já publicadas com assentos disponíveis
+1. **Ofertar Nova Carona** → informe as cidades da rota (ex: `Salvador, Feira`), data (`2026-12-15`), horário (`08:00`), total de assentos e preços por trecho.
+2. **Minhas Caronas Cadastradas** → exibe cartões detalhados de cada carona com rota completa, preços e assentos disponíveis/totais por trecho.
+3. **Cancelar uma Carona** → remove a carona ofertada (pelo ID ou pelo número `#` da lista), marca automaticamente todas as reservas associadas em qualquer servidor do consórcio como `CANCELLED_BY_DRIVER` e devolve as vagas reservadas nos demais trechos do itinerário.
+4. **Trocar de Servidor / Trocar Usuário** → permite alternar rapidamente entre `SERVER_A`, `SERVER_B`, `SERVER_C` (ou outro IP) e trocar o token do motorista sem sair do programa.
 
 ---
 
 ## Usando o Cliente Passageiro
 
-O cliente passageiro se conecta ao servidor da sua empresa e pode buscar e reservar itinerários — inclusive trechos de outras empresas.
+O cliente passageiro se conecta ao servidor da sua empresa e pode buscar, reservar e cancelar itinerários — inclusive rotas combinadas que cruzam várias empresas.
 
-### Modo interativo (menu)
+### Modo interativo (Docker ou Go local)
 
 ```bash
-# Conectar ao servidor local
+# Via Docker Compose (recomendado)
+docker compose run --rm passenger_client
+
+# Ou usando o container já iniciado pelo docker compose up -d
+docker exec -it passenger_client ./passenger-client
+
+# Via Go local (conectando pelo seletor interativo)
 go run cmd/passenger-client/main.go
 
-# Conectar a um servidor específico
+# Conectar diretamente a um servidor específico (local ou remoto)
 go run cmd/passenger-client/main.go localhost:8081
-
-# Conectar a um servidor remoto
 go run cmd/passenger-client/main.go 192.168.1.11:8081
 ```
 
@@ -347,19 +371,24 @@ SERVER_HOST=192.168.1.11:8081 go run cmd/passenger-client/main.go
 ### Fluxo básico no menu
 
 ```
-====================================================
-        CLIENTE PASSAGEIRO — VaiJunto
-====================================================
-[1] Buscar itinerário
-[2] Reservar itinerário
-[3] Ver minhas reservas
-[4] Outro endereço (Host:Porta remoto)
-====================================================
++==============================================================================+
+|  PAINEL DO PASSAGEIRO                                                        |
+|   Passageiro: [Maria]   |   Empresa: [SERVER_A (server_a:8080)]              |
++------------------------------------------------------------------------------+
+|                                                                              |
+|    [1]  Consultar e Reservar Itinerarios (Busca BFS / Reserva 2PC)           |
+|    [2]  Minhas Reservas Efetuadas                                            |
+|    [3]  Cancelar uma Reserva                                                 |
+|    [4]  Trocar de Servidor / Trocar Usuario                                  |
+|    [0]  Encerrar Sessao                                                      |
+|                                                                              |
++==============================================================================+
 ```
 
-1. **Buscar itinerário** → informe origem, destino e data. O servidor busca em todos os parceiros do consórcio e retorna opções de rotas (diretas e combinadas).
-2. **Reservar itinerário** → escolha um dos itinerários listados. O servidor coordena o 2PC com todos os parceiros envolvidos. A reserva é **tudo ou nada**.
-3. **Ver minhas reservas** → lista as reservas confirmadas para seu token.
+1. **Consultar e Reservar Itinerários** → informe origem, destino e data. O servidor consulta todos os parceiros do consórcio via BFS, exibe as opções diretas e combinadas em tabelas detalhadas e coordena a reserva atômica via **Two-Phase Commit (2PC)**.
+2. **Minhas Reservas Efetuadas** → lista todas as reservas do passageiro com seus trechos, empresas responsáveis e status atualizado (`[CONFIRMADA]`, `[CANCELADA PELO PASSAGEIRO]` ou `[CANCELADA PELO MOTORISTA]`).
+3. **Cancelar uma Reserva** → cancela uma reserva confirmada (pelo ID ou pelo número `#` da lista) e devolve automaticamente os assentos a todas as empresas envolvidas no itinerário.
+4. **Trocar de Servidor / Trocar Usuário** → permite alternar rapidamente entre os servidores do consórcio e trocar o token do passageiro.
 
 ### Exemplo de uso completo
 
@@ -484,23 +513,23 @@ O teste executa automaticamente a seguinte sequência:
 [SETUP] Ofertando caronas com 10 assentos em cada empresa...
 
 [EXECUÇÃO] Disparando reservas simultâneas e INJETANDO QUEDA do Servidor B...
-  💥 [INJEÇÃO DE FALHA] CRASH NO SERVIDOR B! Parando porta TCP e API REST interna...
+  [INJEÇÃO DE FALHA] CRASH NO SERVIDOR B! Parando porta TCP e API REST interna...
 [EXECUÇÃO] Rodada sob falha concluída: 3 confirmadas, 12 falharam/recusadas.
 
 [LIVENESS] Testando se o Servidor A continua operando normalmente...
-  ✔ PASSOU: Servidor A continua atendendo requisições independentes do nó que falhou!
+  [OK] PASSOU: Servidor A continua atendendo requisições independentes do nó que falhou!
 
 [RECUPERAÇÃO] Reiniciando Servidor B...
-  ✔ Servidor B reiniciado. Aguardando reconciliação da thread de recovery...
+  [OK] Servidor B reiniciado. Aguardando reconciliação da thread de recovery...
 
 ================================================================
                VERIFICAÇÃO FORMAL DOS INVARIANTES
 ================================================================
-1. ✔ PASSOU: Nenhum assento foi confirmado para mais de um passageiro!
-2. ✔ PASSOU: Atomicidade 2PC respeitada!
-3. ✔ PASSOU: Todas as transações pendentes foram resolvidas pelo Recovery!
+1. [OK] PASSOU: Nenhum assento foi confirmado para mais de um passageiro!
+2. [OK] PASSOU: Atomicidade 2PC respeitada!
+3. [OK] PASSOU: Todas as transações pendentes foram resolvidas pelo Recovery!
 
-RESULTADO FINAL: TODOS OS INVARIANTES DO EDITAL FORAM CONFIRMADOS COM SUCESSO! 🎉
+RESULTADO FINAL: TODOS OS INVARIANTES DO EDITAL FORAM CONFIRMADOS COM SUCESSO!
 ================================================================
 ```
 
@@ -575,7 +604,7 @@ PBL_REDES2/
 │   └── SERVER_C/
 │
 ├── Dockerfile                 # Multi-stage build: server, driver-client, passenger-client
-├── docker-compose.yml         # Orquestração dos 3 servidores em containers isolados
+├── docker-compose.yml         # Orquestração dos 3 servidores e 2 clientes em containers isolados
 ├── go.mod
 └── README.md
 ```

@@ -37,6 +37,7 @@ ENTRYPOINT ["./server"]
 # ==========================================
 FROM alpine:latest AS driver-client
 WORKDIR /app
+RUN apk add --no-cache ca-certificates tzdata
 COPY --from=builder /app/bin/driver-client .
 ENTRYPOINT ["./driver-client"]
 
@@ -45,5 +46,6 @@ ENTRYPOINT ["./driver-client"]
 # ==========================================
 FROM alpine:latest AS passenger-client
 WORKDIR /app
+RUN apk add --no-cache ca-certificates tzdata
 COPY --from=builder /app/bin/passenger-client .
 ENTRYPOINT ["./passenger-client"]
