@@ -213,6 +213,20 @@ func (cm *ClusterManager) ReleaseREST(peerID string, data protocol.ReleaseSeatsD
 	return nil
 }
 
+// NotifyCancelRideREST envia POST /internal/notify-cancel-ride ao peer para que ele
+// marque como CANCELLED_BY_DRIVER as reservas que continham a carona cancelada e
+// devolva as vagas reservadas nos demais trechos daquelas reservas.
+func (cm *ClusterManager) NotifyCancelRideREST(peerID string, data protocol.NotifyCancelRideData) error {
+	status, resp, err := cm.postJSON(peerID, "/internal/notify-cancel-ride", data)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("%s respondeu %d ao notificar cancelamento de carona: %s", peerID, status, resp.Message)
+	}
+	return nil
+}
+
 // DecisionREST pergunta ao coordenador o desfecho de uma transação via GET /internal/transactions/decision.
 // Devolve COMMIT, ABORT, IN_PROGRESS ou UNKNOWN. Se o coordenador não responder, devolve erro,
 // e o participante deve manter a transação pendente e tentar novamente mais tarde.

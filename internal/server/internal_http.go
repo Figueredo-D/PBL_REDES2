@@ -45,15 +45,22 @@ type internalDecisionDTO struct {
 	CoordinatorID string `json:"coordinator_id"`
 }
 
-// StartInternalHTTP sobe a API REST interna do nó em um endereço separado do TCP dos clientes.
-func (s *Server) StartInternalHTTP(addr string) error {
+// internalHTTPHandler constrói o roteador HTTP da API REST interna do nó.
+func (s *Server) internalHTTPHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/rides", s.handleInternalRides)
 	mux.HandleFunc("/internal/prepare", s.handleInternal2PC(protocol.Action2PCPrepare))
 	mux.HandleFunc("/internal/commit", s.handleInternal2PC(protocol.Action2PCCommit))
 	mux.HandleFunc("/internal/abort", s.handleInternal2PC(protocol.Action2PCAbort))
 	mux.HandleFunc("/internal/release", s.handleInternalRelease)
+	mux.HandleFunc("/internal/notify-cancel-ride", s.handleInternalNotifyCancelRide)
 	mux.HandleFunc("/internal/transactions/decision", s.handleInternalDecision)
+	return mux
+}
+
+// StartInternalHTTP sobe a API REST interna do nó em um endereço separado do TCP dos clientes.
+func (s *Server) StartInternalHTTP(addr string) error {
+	mux := s.internalHTTPHandler()
 
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -202,6 +209,56 @@ func (s *Server) handleInternalRelease(w http.ResponseWriter, r *http.Request) {
 		Status:  "SUCCESS",
 		Message: "Devolução de vagas processada.",
 		Data:    fmt.Sprintf(`{"released_segments":%d}`, released),
+	})
+}
+
+// handleInternalNotifyCancelRide implementa POST /internal/notify-cancel-ride.
+// Quando um motorista cancela uma carona em outro servidor, este nó marca todas as
+// reservas locais que usavam aquela carona como CANCELLED_BY_DRIVER e devolve as vagas
+// nos demais trechos do itinerário (locais e remotos).
+func (s *Server) handleInternalNotifyCancelRide(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAPIError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "use o método POST")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_DATA", "não foi possível ler o corpo da requisição")
+		return
+	}
+
+	var data protocol.NotifyCancelRideData
+	if err := json.Unmarshal(body, &data); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_DATA", "corpo da notificação de cancelamento inválido")
+		return
+	}
+	if data.RideID == "" {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_DATA", "ride_id é obrigatório")
+		return
+	}
+
+	var affected []domain.Booking
+	err = s.reqManager.Submit(func() error {
+		affected = s.repo.CancelBookingsByRide(data.RideID)
+		if len(affected) > 0 {
+			s.saveState()
+		}
+		return nil
+	})
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "WORKER_EXECUTION_FAILED", err.Error())
+		return
+	}
+
+	for _, booking := range affected {
+		s.releaseBookingSeats(booking)
+	}
+
+	writeAPIJSON(w, http.StatusOK, protocol.Response{
+		Status:  "SUCCESS",
+		Message: "Cancelamento de carona processado.",
+		Data:    fmt.Sprintf(`{"cancelled_bookings":%d}`, len(affected)),
 	})
 }
 

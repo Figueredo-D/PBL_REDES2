@@ -159,6 +159,8 @@ func (s *Server) route(req protocol.Request) protocol.Response {
 		return s.handleBook(req)
 	case protocol.ActionCancelBooking:
 		return s.handleCancelBooking(req)
+	case protocol.ActionCancelRide:
+		return s.handleCancelRide(req)
 	}
 
 	var resp protocol.Response
@@ -367,63 +369,95 @@ func (s *Server) handleCancelBooking(req protocol.Request) protocol.Response {
 		return protocol.Response{Status: "ERROR", Code: "CANCEL_FAILED", Message: err.Error()}
 	}
 
-	companies := make(map[string]bool)
-	for _, companyID := range booking.PendingReleases {
-		companies[companyID] = true
-	}
-
-	// Garante que cada empresa é processada uma vez, mesmo se houver vários trechos seus.
-	for companyID := range companies {
-		var releaseErr error
-
-		if companyID == s.id {
-			refs := make([]domain.SegmentRef, 0)
-			for _, seg := range booking.Itinerary.Segments {
-				if seg.CompanyID == s.id {
-					refs = append(refs, domain.SegmentRef{RideID: seg.RideID, From: seg.From, To: seg.To})
-				}
-			}
-
-			releaseErr = s.reqManager.Submit(func() error {
-				s.repo.ApplyRelease(booking.ID, refs)
-				s.repo.CompleteRelease(booking.ID, companyID)
-				s.saveState()
-				return nil
-			})
-		} else {
-			releaseData := protocol.ReleaseSeatsData{
-				BookingID: booking.ID,
-				Segments:  make([]protocol.SegmentInfo, 0, len(booking.Itinerary.Segments)),
-			}
-			for _, seg := range booking.Itinerary.Segments {
-				releaseData.Segments = append(releaseData.Segments, protocol.SegmentInfo{
-					RideID:    seg.RideID,
-					CompanyID: seg.CompanyID,
-					From:      seg.From,
-					To:        seg.To,
-				})
-			}
-
-			releaseErr = s.clusterManager.ReleaseREST(companyID, releaseData)
-			if releaseErr == nil {
-				releaseErr = s.reqManager.Submit(func() error {
-					s.repo.CompleteRelease(booking.ID, companyID)
-					s.saveState()
-					return nil
-				})
-			}
-		}
-
-		if releaseErr != nil {
-			fmt.Printf("[SERVER %s] Devolução da reserva %s pendente em %s: %v\n",
-				s.id, booking.ID, companyID, releaseErr)
-		}
-	}
+	s.releaseBookingSeats(booking)
 
 	return protocol.Response{
 		Status:  "SUCCESS",
 		Message: "Reserva cancelada. As devoluções de vagas pendentes serão tentadas novamente.",
 	}
+}
+
+// handleCancelRide remove a carona ofertada pelo motorista, cancela todas as reservas locais
+// que continham essa carona, devolve as vagas dos demais trechos dessas reservas e notifica
+// todos os outros servidores do consórcio para que façam o mesmo com as reservas dos seus passageiros.
+func (s *Server) handleCancelRide(req protocol.Request) protocol.Response {
+	var data protocol.CancelRideData
+	if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
+		return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload inválido."}
+	}
+
+	peers := make([]string, 0, len(s.clusterManager.Peers))
+	for peerID := range s.clusterManager.Peers {
+		if peerID != s.id {
+			peers = append(peers, peerID)
+		}
+	}
+
+	var affectedBookings []domain.Booking
+	if err := s.reqManager.Submit(func() error {
+		if err := s.repo.CancelRide(data.RideID, req.Token); err != nil {
+			return err
+		}
+		affectedBookings = s.repo.CancelBookingsByRide(data.RideID)
+		s.repo.AddPendingRideCancel(data.RideID, peers)
+		s.saveState()
+		return nil
+	}); err != nil {
+		return protocol.Response{Status: "ERROR", Code: "CANCEL_FAILED", Message: err.Error()}
+	}
+
+	fmt.Printf("[SERVER %s] Carona %s cancelada por %s. Reservas locais afetadas: %d.\n",
+		s.id, data.RideID, req.Token, len(affectedBookings))
+
+	for _, booking := range affectedBookings {
+		s.releaseBookingSeats(booking)
+	}
+
+	for _, peerID := range peers {
+		if err := s.notifyPeerRideCancelled(data.RideID, peerID); err != nil {
+			fmt.Printf("[SERVER %s] Notificação de cancelamento da carona %s pendente para %s: %v\n",
+				s.id, data.RideID, peerID, err)
+		}
+	}
+
+	return protocol.Response{
+		Status:  "SUCCESS",
+		Message: "Carona cancelada com sucesso.",
+	}
+}
+
+// releaseBookingSeats dispara a devolução das vagas nos trechos pendentes de uma reserva cancelada.
+func (s *Server) releaseBookingSeats(booking domain.Booking) {
+	companies := make(map[string]bool)
+	for _, companyID := range booking.PendingReleases {
+		if companyID != "" {
+			companies[companyID] = true
+		}
+	}
+
+	for companyID := range companies {
+		if err := s.retryRelease(booking, companyID); err != nil {
+			fmt.Printf("[SERVER %s] Devolução da reserva %s pendente em %s: %v\n",
+				s.id, booking.ID, companyID, err)
+		}
+	}
+}
+
+// notifyPeerRideCancelled avisa um servidor parceiro sobre o cancelamento de uma carona local
+// e remove o parceiro da lista de notificações pendentes quando confirmado.
+func (s *Server) notifyPeerRideCancelled(rideID, peerID string) error {
+	err := s.clusterManager.NotifyCancelRideREST(peerID, protocol.NotifyCancelRideData{
+		RideID: rideID,
+	})
+	if err != nil {
+		return err
+	}
+
+	return s.reqManager.Submit(func() error {
+		s.repo.CompleteRideCancelNotify(rideID, peerID)
+		s.saveState()
+		return nil
+	})
 }
 
 // dispatch executa as ações locais dentro do Single Worker.
@@ -453,18 +487,6 @@ func (s *Server) dispatch(req protocol.Request) protocol.Response {
 		rides := s.repo.ListByDriver(req.Token)
 		data, _ := json.Marshal(rides)
 		return protocol.Response{Status: "SUCCESS", Data: string(data)}
-
-	case protocol.ActionCancelRide:
-		var data protocol.CancelRideData
-		if err := json.Unmarshal([]byte(req.Data), &data); err != nil {
-			return protocol.Response{Status: "ERROR", Code: "INVALID_DATA", Message: "Payload inválido."}
-		}
-		if err := s.repo.CancelRide(data.RideID, req.Token); err != nil {
-			return protocol.Response{Status: "ERROR", Code: "CANCEL_FAILED", Message: err.Error()}
-		}
-		s.saveState()
-		fmt.Printf("[SERVER %s] Carona %s cancelada por %s.\n", s.id, data.RideID, req.Token)
-		return protocol.Response{Status: "SUCCESS", Message: "Carona cancelada com sucesso."}
 
 	case "INTERNAL_LIST_RIDES_BY_DATE":
 		var data struct {

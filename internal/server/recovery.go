@@ -20,6 +20,7 @@ func (s *Server) StartRecovery() {
 	go func() {
 		s.resolveOwnInterrupted()
 		s.recoverPending()
+		s.recoverPendingRideCancels()
 		s.recoverPendingReleases()
 
 		ticker := time.NewTicker(recoveryInterval)
@@ -27,6 +28,7 @@ func (s *Server) StartRecovery() {
 
 		for range ticker.C {
 			s.recoverPending()
+			s.recoverPendingRideCancels()
 			s.recoverPendingReleases()
 		}
 	}()
@@ -76,6 +78,24 @@ func (s *Server) recoverPending() {
 	}
 }
 
+// recoverPendingRideCancels reenvia notificações de cancelamento de carona para peers que estavam indisponíveis.
+func (s *Server) recoverPendingRideCancels() {
+	pendentes := s.repo.PendingRideCancels()
+
+	for rideID, peers := range pendentes {
+		for _, peerID := range peers {
+			if err := s.notifyPeerRideCancelled(rideID, peerID); err != nil {
+				fmt.Printf("[RECOVERY %s] Notificação de cancelamento da carona %s ainda pendente em %s: %v\n",
+					s.id, rideID, peerID, err)
+				continue
+			}
+
+			fmt.Printf("[RECOVERY %s] Notificação de cancelamento da carona %s concluída em %s.\n",
+				s.id, rideID, peerID)
+		}
+	}
+}
+
 // recoverPendingReleases tenta novamente as devoluções de vagas de reservas canceladas.
 // A reserva mantém a lista de empresas pendentes persistida; cada empresa concluída é removida
 // dessa lista para que novas rodadas processem apenas o que ainda falta.
@@ -100,6 +120,7 @@ func (s *Server) recoverPendingReleases() {
 // Em caso de sucesso, registra a conclusão no repositório local.
 func (s *Server) retryRelease(booking domain.Booking, companyID string) error {
 	var err error
+	releaseKey := domain.ReleaseKey(s.id, booking.ID)
 
 	if companyID == s.id {
 		refs := make([]domain.SegmentRef, 0, len(booking.Itinerary.Segments))
@@ -114,14 +135,14 @@ func (s *Server) retryRelease(booking domain.Booking, companyID string) error {
 		}
 
 		err = s.reqManager.Submit(func() error {
-			s.repo.ApplyRelease(booking.ID, refs)
+			s.repo.ApplyRelease(releaseKey, refs)
 			s.repo.CompleteRelease(booking.ID, companyID)
 			s.saveState()
 			return nil
 		})
 	} else {
 		releaseData := protocol.ReleaseSeatsData{
-			BookingID: booking.ID,
+			BookingID: releaseKey,
 			Segments:  make([]protocol.SegmentInfo, 0, len(booking.Itinerary.Segments)),
 		}
 

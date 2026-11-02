@@ -18,6 +18,12 @@ const (
 	// Ação entre nós para devolver as vagas de uma reserva cancelada pelo passageiro.
 	// Não usa 2PC: devolver uma vaga não conflita com outras operações e é idempotente por reserva.
 	ActionReleaseSeats = "RELEASE_SEATS"
+
+	// Ação enviada pelo servidor dono da carona para todos os parceiros do consórcio quando um
+	// motorista cancela sua carona. Os parceiros devem: (1) devolver as vagas do trecho cancelado
+	// em suas caronas que fazem parte de itinerários afetados, e (2) marcar como CANCELLED_BY_DRIVER
+	// todas as reservas de passageiros seus que incluíam aquele trecho.
+	ActionNotifyCancelRide = "NOTIFY_CANCEL_RIDE"
 )
 
 type Request struct {
@@ -43,6 +49,15 @@ type OfferRideData struct {
 
 type CancelRideData struct {
 	RideID string `json:"ride_id"`
+}
+
+// NotifyCancelRideData é o payload de POST /internal/notify-cancel-ride.
+// O servidor dono da carona envia para cada parceiro do consórcio quando um motorista
+// cancela a carona. Os segmentos descrevem os trechos afetados para que os parceiros
+// possam devolver as vagas e marcar as reservas impactadas.
+type NotifyCancelRideData struct {
+	RideID   string        `json:"ride_id"`   // ID da carona cancelada (pertence ao servidor remetente)
+	Segments []SegmentInfo `json:"segments"`  // Trechos da carona, para identificar reservas afetadas
 }
 
 type SearchItineraryData struct {

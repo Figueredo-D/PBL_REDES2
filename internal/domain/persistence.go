@@ -10,12 +10,13 @@ import (
 // estadoPersistido é o conteúdo gravado em disco por um nó. Cada servidor tem o seu próprio arquivo,
 // por exemplo data/SERVER_A/estado.json, e nenhum nó lê ou escreve o arquivo de outro.
 type estadoPersistido struct {
-	NodeID       string              `json:"node_id"`
-	RideCount    int                 `json:"ride_count"`
-	BookingCount int                 `json:"booking_count"`
-	Rides        map[string]*Ride    `json:"rides"`
-	Bookings     map[string]*Booking `json:"bookings"`
-	Released     map[string]bool     `json:"released"` // reservas canceladas cujas vagas locais já foram devolvidas
+	NodeID             string              `json:"node_id"`
+	RideCount          int                 `json:"ride_count"`
+	BookingCount       int                 `json:"booking_count"`
+	Rides              map[string]*Ride    `json:"rides"`
+	Bookings           map[string]*Booking `json:"bookings"`
+	Released           map[string]bool     `json:"released"`                       // reservas canceladas cujas vagas locais já foram devolvidas
+	PendingRideCancels map[string][]string `json:"pending_ride_cancels,omitempty"` // caronas canceladas cujos peers ainda precisam ser avisados
 }
 
 // copiaRide faz uma cópia independente da carona, lida sob a trava de leitura dela.
@@ -50,13 +51,32 @@ func (r *RideRepository) SaveToFile(path string) error {
 	for id, ride := range r.rides {
 		copias[id] = copiaRide(ride)
 	}
+	copiasBookings := make(map[string]*Booking, len(r.bookings))
+	for id, b := range r.bookings {
+		cb := *b
+		if len(b.PendingReleases) > 0 {
+			cb.PendingReleases = append([]string(nil), b.PendingReleases...)
+		}
+		copiasBookings[id] = &cb
+	}
+	copiasReleased := make(map[string]bool, len(r.released))
+	for k, v := range r.released {
+		copiasReleased[k] = v
+	}
+	copiasPendingCancels := make(map[string][]string, len(r.pendingRideCancels))
+	for rideID, peers := range r.pendingRideCancels {
+		if len(peers) > 0 {
+			copiasPendingCancels[rideID] = append([]string(nil), peers...)
+		}
+	}
 	estado := estadoPersistido{
-		NodeID:       r.nodeID,
-		RideCount:    r.rideCount,
-		BookingCount: r.bookingCount,
-		Rides:        copias,
-		Bookings:     r.bookings,
-		Released:     r.released,
+		NodeID:             r.nodeID,
+		RideCount:          r.rideCount,
+		BookingCount:       r.bookingCount,
+		Rides:              copias,
+		Bookings:           copiasBookings,
+		Released:           copiasReleased,
+		PendingRideCancels: copiasPendingCancels,
 	}
 	dados, err := json.MarshalIndent(estado, "", "  ")
 	r.mu.RUnlock()
@@ -114,6 +134,9 @@ func LoadRideRepository(nodeID, path string) (*RideRepository, error) {
 	}
 	if estado.Released != nil {
 		repo.released = estado.Released
+	}
+	if estado.PendingRideCancels != nil {
+		repo.pendingRideCancels = estado.PendingRideCancels
 	}
 
 	return repo, nil

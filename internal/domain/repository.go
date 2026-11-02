@@ -2,9 +2,19 @@ package domain
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
+
+// ReleaseKey garante que a chave de idempotência de devolução de vagas inclua o ID do nó dono da reserva,
+// evitando colisão caso reservas antigas de servidores distintos tenham o mesmo sufixo (ex: BOOK_0001).
+func ReleaseKey(nodeID, bookingID string) string {
+	if nodeID == "" || strings.HasPrefix(bookingID, nodeID+"_") {
+		return bookingID
+	}
+	return nodeID + "_" + bookingID
+}
 
 // Booking representa o registro de uma reserva feita por um passageiro no servidor.
 // PendingReleases lista as empresas que ainda precisam devolver as vagas de uma reserva cancelada.
@@ -19,22 +29,24 @@ type Booking struct {
 
 // RideRepository é o repositório em memória do servidor local.
 type RideRepository struct {
-	mu           sync.RWMutex
-	nodeID       string
-	rides        map[string]*Ride
-	bookings     map[string]*Booking
-	released     map[string]bool // IDs de reservas cujas vagas locais já foram devolvidas (idempotência)
-	rideCount    int
-	bookingCount int
+	mu                 sync.RWMutex
+	nodeID             string
+	rides              map[string]*Ride
+	bookings           map[string]*Booking
+	released           map[string]bool     // IDs de reservas cujas vagas locais já foram devolvidas (idempotência)
+	pendingRideCancels map[string][]string // rideID -> lista de peers que ainda precisam ser avisados do cancelamento
+	rideCount          int
+	bookingCount       int
 }
 
 // NewRideRepository instancia e inicializa um novo repositório limpo em memória.
 func NewRideRepository(nodeID string) *RideRepository {
 	return &RideRepository{
-		nodeID:   nodeID,
-		rides:    make(map[string]*Ride),
-		bookings: make(map[string]*Booking),
-		released: make(map[string]bool),
+		nodeID:             nodeID,
+		rides:              make(map[string]*Ride),
+		bookings:           make(map[string]*Booking),
+		released:           make(map[string]bool),
+		pendingRideCancels: make(map[string][]string),
 	}
 }
 
@@ -97,22 +109,98 @@ func (r *RideRepository) CancelRide(rideID, driverToken string) error {
 	return nil
 }
 
-// MarkBookingsCancelledByRide marca como cancelada qualquer reserva guardada neste nó que contenha a carona informada.
-func (r *RideRepository) MarkBookingsCancelledByRide(rideID string) int {
+// CancelBookingsByRide marca como CANCELLED_BY_DRIVER qualquer reserva guardada neste nó que contenha
+// a carona informada e agenda a devolução das vagas nos demais trechos do itinerário.
+// Devolve cópias das reservas que estavam CONFIRMED e foram canceladas para disparo imediato das devoluções.
+func (r *RideRepository) CancelBookingsByRide(rideID string) []Booking {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	count := 0
+	var affected []Booking
 	for _, b := range r.bookings {
+		hasRide := false
 		for _, seg := range b.Itinerary.Segments {
-			if seg.RideID == rideID && b.Status != "CANCELLED_BY_DRIVER" {
-				b.Status = "CANCELLED_BY_DRIVER"
-				count++
+			if seg.RideID == rideID {
+				hasRide = true
 				break
 			}
 		}
+		if !hasRide {
+			continue
+		}
+
+		if b.Status == "CONFIRMED" {
+			seen := make(map[string]bool)
+			var companies []string
+			for _, seg := range b.Itinerary.Segments {
+				if seg.RideID == rideID {
+					continue
+				}
+				if seg.CompanyID != "" && !seen[seg.CompanyID] {
+					seen[seg.CompanyID] = true
+					companies = append(companies, seg.CompanyID)
+				}
+			}
+			b.Status = "CANCELLED_BY_DRIVER"
+			b.PendingReleases = companies
+			affected = append(affected, *b)
+		} else if b.Status != "CANCELLED_BY_DRIVER" && b.Status != "CANCELLED" {
+			b.Status = "CANCELLED_BY_DRIVER"
+			affected = append(affected, *b)
+		}
 	}
-	return count
+	return affected
+}
+
+// AddPendingRideCancel registra quais nós parceiros precisam ser notificados do cancelamento de uma carona local.
+func (r *RideRepository) AddPendingRideCancel(rideID string, peers []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(peers) == 0 {
+		return
+	}
+	copia := make([]string, len(peers))
+	copy(copia, peers)
+	r.pendingRideCancels[rideID] = copia
+}
+
+// CompleteRideCancelNotify remove um parceiro da lista de notificações pendentes de cancelamento de carona.
+func (r *RideRepository) CompleteRideCancelNotify(rideID, peerID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	peers, exists := r.pendingRideCancels[rideID]
+	if !exists {
+		return
+	}
+	var restantes []string
+	for _, p := range peers {
+		if p != peerID {
+			restantes = append(restantes, p)
+		}
+	}
+	if len(restantes) == 0 {
+		delete(r.pendingRideCancels, rideID)
+	} else {
+		r.pendingRideCancels[rideID] = restantes
+	}
+}
+
+// PendingRideCancels retorna uma cópia do mapa de caronas canceladas cujas notificações aos peers ainda estão pendentes.
+func (r *RideRepository) PendingRideCancels() map[string][]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make(map[string][]string, len(r.pendingRideCancels))
+	for rideID, peers := range r.pendingRideCancels {
+		if len(peers) > 0 {
+			c := make([]string, len(peers))
+			copy(c, peers)
+			out[rideID] = c
+		}
+	}
+	return out
 }
 
 // ListByDate busca todas as caronas registradas para uma determinada data.
@@ -190,7 +278,7 @@ func (r *RideRepository) SaveBooking(passengerToken string, itinerary ItineraryR
 	defer r.mu.Unlock()
 
 	r.bookingCount++
-	bookingID := fmt.Sprintf("BOOK_%04d", r.bookingCount)
+	bookingID := fmt.Sprintf("%s_BOOK_%04d", r.nodeID, r.bookingCount)
 	booking := &Booking{
 		ID:             bookingID,
 		PassengerToken: passengerToken,
